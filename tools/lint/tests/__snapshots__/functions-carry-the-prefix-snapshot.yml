@@ -1,0 +1,72 @@
+id: functions-carry-the-prefix
+snapshots:
+  PyMODINIT_FUNC PyInit__tinyactors(void) { return NULL; }:
+    labels:
+    - source: PyInit__tinyactors
+      style: primary
+      start: 15
+      end: 33
+    - source: PyMODINIT_FUNC PyInit__tinyactors(void) { return NULL; }
+      style: secondary
+      start: 0
+      end: 56
+    - source: PyInit__tinyactors(void)
+      style: secondary
+      start: 15
+      end: 39
+  int tp_traverse(PyObject *self, visitproc visit, void *arg) { return 0; }:
+    labels:
+    - source: tp_traverse
+      style: primary
+      start: 4
+      end: 15
+    - source: int tp_traverse(PyObject *self, visitproc visit, void *arg) { return 0; }
+      style: secondary
+      start: 0
+      end: 73
+    - source: tp_traverse(PyObject *self, visitproc visit, void *arg)
+      style: secondary
+      start: 4
+      end: 59
+  static PyObject *convert(PyObject *value);:
+    labels:
+    - source: convert
+      style: primary
+      start: 17
+      end: 24
+    - source: static PyObject *convert(PyObject *value);
+      style: secondary
+      start: 0
+      end: 42
+    - source: convert(PyObject *value)
+      style: secondary
+      start: 17
+      end: 41
+  static int host_traverse(PyObject *self, visitproc visit, void *arg) { return 0; }:
+    labels:
+    - source: host_traverse
+      style: primary
+      start: 11
+      end: 24
+    - source: static int host_traverse(PyObject *self, visitproc visit, void *arg) { return 0; }
+      style: secondary
+      start: 0
+      end: 82
+    - source: host_traverse(PyObject *self, visitproc visit, void *arg)
+      style: secondary
+      start: 11
+      end: 68
+  static ta_status ta_napi_spawn(ta_host *host) { return TA_OK; }:
+    labels:
+    - source: ta_napi_spawn
+      style: primary
+      start: 17
+      end: 30
+    - source: static ta_status ta_napi_spawn(ta_host *host) { return TA_OK; }
+      style: secondary
+      start: 0
+      end: 63
+    - source: ta_napi_spawn(ta_host *host)
+      style: secondary
+      start: 17
+      end: 45

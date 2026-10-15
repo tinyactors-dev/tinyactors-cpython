@@ -1,0 +1,20 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="c" initial="p">
+  <datamodel>
+    <data id="items" expr="[1, 2, 3]" />
+    <data id="total" expr="0" />
+    <data id="item" />
+    <data id="i" />
+  </datamodel>
+  <parallel id="p">
+    <state id="a" />
+    <state id="b">
+      <onentry>
+        <foreach item="item" index="i" array="items">
+          <assign location="total" expr="total + item * i" />
+        </foreach>
+        <log label="in" expr="str((In('a'), In('nope')))" />
+        <log label="t" expr="str(total)" />
+      </onentry>
+    </state>
+  </parallel>
+</scxml>

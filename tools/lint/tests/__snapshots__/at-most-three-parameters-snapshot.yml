@@ -1,0 +1,52 @@
+id: at-most-three-parameters
+snapshots:
+  static PyObject *ta_python_convert(PyObject *value, int depth, ta_buffer *out, uint32_t flags);:
+    labels:
+    - source: ta_python_convert(PyObject *value, int depth, ta_buffer *out, uint32_t flags)
+      style: primary
+      start: 17
+      end: 94
+    - source: (PyObject *value, int depth, ta_buffer *out, uint32_t flags)
+      style: secondary
+      start: 34
+      end: 94
+  ? static PyObject *ta_python_method(PyObject *self, PyTypeObject *cls, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames) { return NULL; }
+  : labels:
+    - source: ta_python_method(PyObject *self, PyTypeObject *cls, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames)
+      style: primary
+      start: 17
+      end: 128
+    - source: (PyObject *self, PyTypeObject *cls, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames)
+      style: secondary
+      start: 33
+      end: 128
+  static int ta_python_helper(int a, int b, int c, int d) { return 0; }:
+    labels:
+    - source: ta_python_helper(int a, int b, int c, int d)
+      style: primary
+      start: 11
+      end: 55
+    - source: (int a, int b, int c, int d)
+      style: secondary
+      start: 27
+      end: 55
+  typedef int (*ta_python_callback)(void *context, int a, int b, int c);:
+    labels:
+    - source: (*ta_python_callback)(void *context, int a, int b, int c)
+      style: primary
+      start: 12
+      end: 69
+    - source: (void *context, int a, int b, int c)
+      style: secondary
+      start: 33
+      end: 69
+  typedef struct ta_python_hooks { int (*visit)(PyObject *object, void *argument, int a, int b); } ta_python_hooks;:
+    labels:
+    - source: (*visit)(PyObject *object, void *argument, int a, int b)
+      style: primary
+      start: 37
+      end: 93
+    - source: (PyObject *object, void *argument, int a, int b)
+      style: secondary
+      start: 45
+      end: 93

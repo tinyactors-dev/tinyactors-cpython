@@ -1,0 +1,16 @@
+id: functions-carry-the-prefix
+valid:
+  - "static int ta_python_host_traverse(PyObject *self, visitproc visit, void *arg) { return 0; }"
+  - "static PyObject *ta_python_host_new(PyTypeObject *type, PyObject *args, PyObject *kwargs);"
+  - "PyMODINIT_FUNC PyInit_tinyactors(void) { return PyModuleDef_Init(&ta_python_module); }"
+  - "static PyType_Slot ta_python_host_slots[] = {{Py_tp_traverse, ta_python_host_traverse}, {0, NULL}};"
+  - "typedef int (*ta_python_visit)(PyObject *object, void *argument);"
+  - "typedef struct ta_python_hooks { int (*visit)(PyObject *object, void *argument); } ta_python_hooks;"
+  - "static void ta_python_run(ta_host *host) { ta_host_run(host, 1000); }"
+  - "static void (*ta_python_hook)(void) = NULL;"
+invalid:
+  - "static int host_traverse(PyObject *self, visitproc visit, void *arg) { return 0; }"
+  - "static PyObject *convert(PyObject *value);"
+  - "PyMODINIT_FUNC PyInit__tinyactors(void) { return NULL; }"
+  - "int tp_traverse(PyObject *self, visitproc visit, void *arg) { return 0; }"
+  - "static ta_status ta_napi_spawn(ta_host *host) { return TA_OK; }"

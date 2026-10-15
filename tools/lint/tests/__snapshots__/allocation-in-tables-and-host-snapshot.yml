@@ -1,0 +1,88 @@
+id: allocation-in-tables-and-host
+snapshots:
+  static char *ta_python_copy(size_t length) { return PyMem_Malloc(length); }:
+    labels:
+    - source: PyMem_Malloc(length)
+      style: primary
+      start: 52
+      end: 72
+    - source: PyMem_Malloc
+      style: secondary
+      start: 52
+      end: 64
+  static const ta_allocator *ta_python_leak(void) { return &ta_python_allocator; }:
+    labels:
+    - source: ta_python_allocator
+      style: primary
+      start: 58
+      end: 77
+  static void *ta_python_libc(size_t length) { return malloc(length); }:
+    labels:
+    - source: malloc(length)
+      style: primary
+      start: 52
+      end: 66
+    - source: malloc
+      style: secondary
+      start: 52
+      end: 58
+  static void *ta_python_object(size_t length) { return PyObject_Malloc(length); }:
+    labels:
+    - source: PyObject_Malloc(length)
+      style: primary
+      start: 54
+      end: 77
+    - source: PyObject_Malloc
+      style: secondary
+      start: 54
+      end: 69
+  static void *ta_python_room(size_t length) { return PyMem_RawMalloc(length); }:
+    labels:
+    - source: PyMem_RawMalloc(length)
+      style: primary
+      start: 52
+      end: 75
+    - source: PyMem_RawMalloc
+      style: secondary
+      start: 52
+      end: 67
+  static void ta_python_drop(void *room) { PyMem_Free(room); }:
+    labels:
+    - source: PyMem_Free(room)
+      style: primary
+      start: 41
+      end: 57
+    - source: PyMem_Free
+      style: secondary
+      start: 41
+      end: 51
+  static void ta_python_grow(ta_cbor_writer *writer, ta_buffer room) { ta_cbor_writer_init(writer, room, &ta_python_allocator); }:
+    labels:
+    - source: ta_cbor_writer_init(writer, room, &ta_python_allocator)
+      style: primary
+      start: 69
+      end: 124
+    - source: ta_cbor_writer_init
+      style: secondary
+      start: 69
+      end: 88
+  static void ta_python_own(ta_cbor_writer *writer, ta_buffer room) { ta_cbor_writer_init(writer, room, NULL); }:
+    labels:
+    - source: ta_cbor_writer_init(writer, room, NULL)
+      style: primary
+      start: 68
+      end: 107
+    - source: ta_cbor_writer_init
+      style: secondary
+      start: 68
+      end: 87
+  static void ta_python_release(void *room) { free(room); }:
+    labels:
+    - source: free(room)
+      style: primary
+      start: 44
+      end: 54
+    - source: free
+      style: secondary
+      start: 44
+      end: 48

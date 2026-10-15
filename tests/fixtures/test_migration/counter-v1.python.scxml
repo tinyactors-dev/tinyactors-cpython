@@ -1,0 +1,17 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="counter" initial="s">
+  <datamodel>
+    <data id="n" expr="0" />
+    <data id="other" expr="0" />
+  </datamodel>
+  <state id="s">
+    <transition event="inc">
+      <assign location="n" expr="n + 1" />
+    </transition>
+    <transition event="wait">
+      <send event="later" delay="1s" />
+    </transition>
+    <transition event="odd">
+      <assign location="other" expr="{1, 2}" />
+    </transition>
+  </state>
+</scxml>

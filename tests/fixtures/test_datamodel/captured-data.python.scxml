@@ -1,0 +1,13 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="c" initial="s">
+  <datamodel>
+    <data id="items" expr="[1, 2, 3]" />
+  </datamodel>
+  <state id="s">
+    <onentry>
+      <send type="urn:test:app" target="app" event="e">
+        <param name="v" expr="items" />
+      </send>
+      <script>items.append(4)</script>
+    </onentry>
+  </state>
+</scxml>

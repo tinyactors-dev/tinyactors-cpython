@@ -1,0 +1,15 @@
+id: at-most-three-parameters
+valid:
+  - "static PyObject *ta_python_host_run(PyObject *self, PyTypeObject *defining_class, PyObject *const *args, size_t nargs, PyObject *kwnames) { return NULL; }"
+  - "static PyObject *ta_python_host_send(PyObject *module, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames) { return NULL; }"
+  - "static PyObject *ta_python_host_spawn(PyObject *self, PyTypeObject *cls, PyObject *const *args, size_t count, PyObject *names);"
+  - "static int ta_python_host_traverse(PyObject *self, visitproc visit, void *arg) { return 0; }"
+  - "static ta_status ta_python_spawn(ta_python_host *host, const ta_python_spawn_arguments *arguments, uint64_t *session) { return TA_OK; }"
+  - "typedef struct ta_python_hooks { int (*visit)(PyObject *object, void *argument); } ta_python_hooks;"
+  - "static void ta_python_free(void *context, void *pointer, size_t size) { PyMem_RawFree(pointer); }"
+invalid:
+  - "static int ta_python_helper(int a, int b, int c, int d) { return 0; }"
+  - "static PyObject *ta_python_convert(PyObject *value, int depth, ta_buffer *out, uint32_t flags);"
+  - "typedef int (*ta_python_callback)(void *context, int a, int b, int c);"
+  - "typedef struct ta_python_hooks { int (*visit)(PyObject *object, void *argument, int a, int b); } ta_python_hooks;"
+  - "static PyObject *ta_python_method(PyObject *self, PyTypeObject *cls, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames) { return NULL; }"

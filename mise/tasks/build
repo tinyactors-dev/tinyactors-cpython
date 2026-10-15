@@ -1,0 +1,33 @@
+#!/usr/bin/env ruby
+#MISE description="Build core's amalgamation into build/core (tinyactors-core's amalgamate task with --out), then the extension against it: abi3 for python 3.13 in build/abi3, and the free-threaded tests' build in build/free-threaded"
+#MISE depends=["amalgamate"]
+# vim:ft=ruby
+
+# Core is built from its amalgamation in this project's own build/, never
+# by running tinyactors-core's build (AGENTS.md, "Tasks"): the amalgamate
+# task writes the headers and sources there and checks that each compiles
+# on its own (tinyactors-core/mise/tasks/amalgamate).
+# The extension links tinyactors.c, tinyactors_runtime.c with its hosted
+# platform file, and tinyactors_datamodel_ecmascript.c (quickjs beside the
+# native datamodel, tinyactors-core/docs/bindings.md, section 8), compiled
+# with the pinned clang for this machine (Toolchain::Target.host), never a
+# compiler from PATH or $CC.
+
+require_relative '../cpython'
+require 'task_stamp'
+
+# mise checks source freshness but can skip a task with a deleted output.
+# Use the workspace's recovery rule after the dependency's normal check.
+force = TaskStamp.force(CPython::ROOT, 'amalgamate')
+CPython.run('mise', 'run', *force, 'amalgamate') unless force.empty?
+
+target = Toolchain::Target.host
+core = CPython.core_objects(target)
+unless CPython.extension?
+  puts 'build: no extension yet (src/): core\'s amalgamation only'
+  exit
+end
+CPython.builds.each do |build|
+  extension = CPython.build_extension(target, build, core)
+  puts "build: #{extension.relative_path_from(CPython::ROOT)}"
+end

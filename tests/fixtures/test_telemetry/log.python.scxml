@@ -1,0 +1,11 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="c" initial="s">
+  <datamodel>
+    <data id="n" expr="0" />
+  </datamodel>
+  <state id="s">
+    <transition event="go">
+      <log label="l" expr="'hi'" />
+      <assign location="n" expr="n + 1" />
+    </transition>
+  </state>
+</scxml>

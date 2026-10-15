@@ -1,0 +1,10 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="c" initial="s">
+  <state id="s">
+    <transition event="go">
+      <assign location="_event.name" expr="'x'" />
+    </transition>
+    <transition event="error.execution">
+      <log label="e" expr="'refused'" />
+    </transition>
+  </state>
+</scxml>

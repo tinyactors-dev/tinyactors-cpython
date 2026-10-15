@@ -1,0 +1,27 @@
+# The extension calls core (ta_*, TA_* macros, our own ta_python_*) and
+# CPython's API (Py*), and nothing else (AGENTS.md, "C rules": layers;
+# tinyactors-core/docs/bindings.md, sections 1 and 2): no other
+# library, no twin of what C or the runtime does, no private CPython
+# function (_Py*, outside the limited API the wheel is built with).
+#
+# Of the C library it calls only the memory and string functions below,
+# which value conversion needs. Memory comes from CPython's raw domain,
+# PyMem_RawMalloc and PyMem_RawFree (the host's allocator, AGENTS.md; in
+# the limited API from 3.13, Include/pymem.h: line 90), never from malloc,
+# calloc, realloc or free. A C library function the binding needs is
+# added to this list with its reason, in the commit that first calls it.
+# Calls through a pointer (a vtable entry) are not checked.
+id: extension-calls-core-and-python
+language: c
+severity: error
+message: "the extension calls core (ta_*), CPython's API (Py*) and the C library functions this rule lists, nothing else"
+files:
+  - src/**/*.c
+  - src/**/*.h
+rule:
+  kind: call_expression
+  has:
+    field: function
+    kind: identifier
+    not:
+      regex: '^(ta_\w+|TA_\w+|Py\w+|offsetof|assert|static_assert|_Static_assert|memcpy|memmove|memset|memcmp|memchr|strlen)$'

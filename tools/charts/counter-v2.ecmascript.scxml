@@ -1,0 +1,20 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="counter" initial="s">
+  <datamodel>
+    <data id="n" expr="0" />
+    <data id="last" expr="null" />
+    <data id="version" expr="2" />
+  </datamodel>
+  <state id="s">
+    <transition event="error.platform.upgrade">
+      <assign location="n" expr="_event.data.n" />
+      <assign location="last" expr="_event.data.last" />
+    </transition>
+    <transition event="inc">
+      <assign location="n" expr="n + 1" />
+      <assign location="last" expr="_event.data" />
+    </transition>
+    <transition event="report">
+      <log label="count" expr="_sessionid + ' ' + n + ' ' + version" />
+    </transition>
+  </state>
+</scxml>

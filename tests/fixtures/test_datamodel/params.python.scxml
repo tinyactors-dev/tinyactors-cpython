@@ -1,0 +1,10 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="c" initial="s">
+  <datamodel>
+    <data id="n" expr="0" />
+  </datamodel>
+  <state id="s">
+    <onentry>
+      <log label="n" expr="str(n)" />
+    </onentry>
+  </state>
+</scxml>

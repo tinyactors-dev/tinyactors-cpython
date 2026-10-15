@@ -1,0 +1,13 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="counter" initial="s">
+  <datamodel>
+    <data id="n" expr="0" />
+  </datamodel>
+  <state id="s">
+    <transition event="inc">
+      <assign location="n" expr="n + (_event.data or 1)" />
+    </transition>
+    <transition event="show">
+      <log label="n" expr="str(n)" />
+    </transition>
+  </state>
+</scxml>

@@ -1,0 +1,23 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="client" initial="s">
+  <state id="s">
+    <invoke id="echo" type="urn:test:echo" src="echo://here">
+      <param name="hello" expr="'world'" />
+    </invoke>
+    <transition event="ask">
+      <send target="#_echo" event="question">
+        <content expr="_event.data" />
+      </send>
+    </transition>
+    <transition event="answer">
+      <log label="answer" expr="f'{_event.data} {_event.invokeid}'" />
+    </transition>
+    <transition event="done.invoke.echo" target="over">
+      <log label="done" expr="str(_event.data)" />
+    </transition>
+    <transition event="error.communication">
+      <log label="error" expr="'communication'" />
+    </transition>
+    <transition event="leave" target="over" />
+  </state>
+  <state id="over" />
+</scxml>

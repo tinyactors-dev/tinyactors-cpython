@@ -1,0 +1,80 @@
+#!/usr/bin/env ruby
+#MISE description="Test tinyactors-cpython: lint (rules, the binding's C, the adapter, the mapping table, the build scripts, acronyms), the build, the interpreters, and the conformance set named by MILESTONE against the adapter on both datamodels"
+#MISE sources=["src/**/*", "conform/**/*", "tests/**/*", "tools/**/*", "docs/api-map.md", "sgconfig.yml", "pyproject.toml", "mise/**/*", "mise.toml", "../tinyactors-core/include/**/*", "../tinyactors-core/src/**/*", "../tinyactors-core/third_party/**/*", "../tinyactors-core/mise/**/*", "../tinyactors-core/tools/lint/utils/**/*", "../tinyactors-core/docs/requests.md", "../tinyactors-test/suites/**/*", "../tinyactors-test/lib/**/*", "../tinyactors-test/lint/**/*", "../tinyactors-test/mise/**/*", "../tinyactors-test/mise.toml", "../mise/lib/**/*", "../mise/ast-grep/**/*", "../sgconfig.yml", "../acronyms.txt", "../acronyms-allow.txt", "../mise.toml", "../LICENSE"]
+#MISE outputs={auto=true}
+#USAGE flag "--full" help="the hibernation, migration and snapshot gates at 2,000,000 actors, 1000 resident, snapshots of 100,000 resident actors, and 200,000 invoked services"
+# vim:ft=ruby
+
+# The sources are this project's files and those it builds and tests
+# against: core's (its amalgamation, the lint utilities, requests.md for
+# the mapping table) and the suite's, so a change to either reruns this
+# task from the root's `mise run test` (AGENTS.md, "Tests: what to run").
+#
+# It lints, builds the extension for both interpreters and runs tests/ on
+# each with its build on PYTHONPATH (unittest, the standard library's).
+# The conformance suite needs the adapter (conform/): with it, the part of
+# the set named by CPython::MILESTONE that CPython::GATE holds now must
+# pass (`mise run conform -- --milestone <it> --suite <each>`, on the
+# gate's datamodels). `mise run conform` on its own runs the whole suite
+# on both datamodels.
+#
+# Then the hibernation stress gate (tools/stress.py, `mise run stress`):
+# 20,000 actors with 100 resident in the fast pass, 2,000,000 with 1000
+# resident under --full (root AGENTS.md, "Where a new test goes"); and
+# the live migration gate (tools/migration.py, `mise run migration`):
+# 20,000 actors with 100 resident, 2,000,000 with 1000 under --full; and
+# the snapshot gate (tools/snapshot.py, `mise run snapshot`: a deploy
+# rehearsed on a copy of a live host, with payments in flight) the same, and
+# once with every actor resident (5,000 in the fast pass, 100,000 under
+# --full), so that the datamodels' own state is most of the snapshot;
+# and the invoked services gate (tools/services.py, `mise run services`):
+# 10,000 actors each with a service and 50,000 round trips, 200,000 and
+# 1,000,000 under --full.
+
+require_relative '../cpython'
+
+CPython.run('mise', 'run', 'lint')
+CPython.run('mise', 'run', 'build')
+
+if !CPython.extension?
+  puts 'test: tests skipped: no extension yet (src/)'
+elsif !CPython.tests?
+  puts 'test: tests skipped: no tests yet (tests/)'
+else
+  CPython.builds.each do |build|
+    version = IO.popen([build.python, '-c', 'import sys, sysconfig; print(sys.version.split()[0], ' \
+                                            '"free-threaded" if sysconfig.get_config_var("Py_GIL_DISABLED") else "with the GIL")'],
+                       &:read).strip
+    puts "test: python #{version}, the #{build.name} build: tests/"
+    CPython.run(build.python, '-m', 'unittest', 'discover', '--start-directory', 'tests',
+                env: { 'PYTHONPATH' => build.directory.to_s })
+  end
+end
+
+gate = CPython::GATE
+if !CPython::ADAPTER.exist?
+  puts 'test: conform skipped: no adapter yet (conform/)'
+elsif gate[:suites].empty? || gate[:datamodels].empty?
+  puts 'test: conform skipped: the gate holds no suite yet (GATE, mise/cpython.rb)'
+else
+  CPython.run('mise', 'run', 'conform', '--', '--milestone', CPython::MILESTONE,
+              *gate[:suites].flat_map { |suite| ['--suite', suite] },
+              env: { 'TA_PYTHON_DATAMODELS' => gate[:datamodels].join(',') })
+end
+
+full = ENV['usage_full'] == 'true' || ARGV.include?('--full')
+if CPython.extension?
+  if full
+    CPython.stress(actors: 2_000_000, resident: 1000, events: 200_000)
+    CPython.stress(actors: 2_000_000, resident: 1000, events: 200_000, tool: 'migration')
+    CPython.stress(actors: 2_000_000, resident: 1000, events: 200_000, tool: 'snapshot')
+    CPython.stress(actors: 100_000, resident: 100_000, events: 100_000, tool: 'snapshot')
+    CPython.stress(actors: 200_000, events: 1_000_000, tool: 'services')
+  else
+    CPython.stress(actors: 20_000, resident: 100, events: 20_000)
+    CPython.stress(actors: 20_000, resident: 100, events: 20_000, tool: 'migration')
+    CPython.stress(actors: 20_000, resident: 100, events: 20_000, tool: 'snapshot')
+    CPython.stress(actors: 5_000, resident: 5_000, events: 5_000, tool: 'snapshot')
+    CPython.stress(actors: 10_000, events: 50_000, tool: 'services')
+  end
+end

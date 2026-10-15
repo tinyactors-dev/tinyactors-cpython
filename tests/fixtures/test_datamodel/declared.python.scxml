@@ -1,0 +1,20 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="c" initial="s">
+  <datamodel>
+    <data id="items" expr="[10, 20]" />
+  </datamodel>
+  <script>
+count = 2
+for seen in items:
+    count = count + 1
+  </script>
+  <state id="s">
+    <onentry>
+      <log label="before" expr="str([each, at])" />
+      <foreach item="each" index="at" array="items" />
+      <log label="after" expr="str([count, seen, each, at])" />
+    </onentry>
+    <transition event="report">
+      <log label="report" expr="str([count, seen, each, at])" />
+    </transition>
+  </state>
+</scxml>

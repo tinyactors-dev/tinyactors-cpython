@@ -1,0 +1,92 @@
+id: extension-calls-core-and-python
+snapshots:
+  static uint64_t ta_python_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return 0; }:
+    labels:
+    - source: clock_gettime(CLOCK_MONOTONIC, &t)
+      style: primary
+      start: 57
+      end: 91
+    - source: clock_gettime
+      style: secondary
+      start: 57
+      end: 70
+  static void *ta_python_allocate(size_t size) { return malloc(size); }:
+    labels:
+    - source: malloc(size)
+      style: primary
+      start: 54
+      end: 66
+    - source: malloc
+      style: secondary
+      start: 54
+      end: 60
+  static void *ta_python_grow(void *pointer, size_t size) { return realloc(pointer, size); }:
+    labels:
+    - source: realloc(pointer, size)
+      style: primary
+      start: 65
+      end: 87
+    - source: realloc
+      style: secondary
+      start: 65
+      end: 72
+  static void *ta_python_zeroed(size_t size) { return calloc(1, size); }:
+    labels:
+    - source: calloc(1, size)
+      style: primary
+      start: 52
+      end: 67
+    - source: calloc
+      style: secondary
+      start: 52
+      end: 58
+  static void ta_python_eval(JSContext *context) { JS_Eval(context, "1", 1, "x", 0); }:
+    labels:
+    - source: JS_Eval(context, "1", 1, "x", 0)
+      style: primary
+      start: 49
+      end: 81
+    - source: JS_Eval
+      style: secondary
+      start: 49
+      end: 56
+  static void ta_python_log(const char *text) { printf("%s", text); }:
+    labels:
+    - source: printf("%s", text)
+      style: primary
+      start: 46
+      end: 64
+    - source: printf
+      style: secondary
+      start: 46
+      end: 52
+  static void ta_python_release(void *pointer) { free(pointer); }:
+    labels:
+    - source: free(pointer)
+      style: primary
+      start: 47
+      end: 60
+    - source: free
+      style: secondary
+      start: 47
+      end: 51
+  static void ta_python_track(PyObject *object) { _PyObject_GC_TRACK(object); }:
+    labels:
+    - source: _PyObject_GC_TRACK(object)
+      style: primary
+      start: 48
+      end: 74
+    - source: _PyObject_GC_TRACK
+      style: secondary
+      start: 48
+      end: 66
+  static void ta_python_wait(void) { usleep(1000); }:
+    labels:
+    - source: usleep(1000)
+      style: primary
+      start: 35
+      end: 47
+    - source: usleep
+      style: secondary
+      start: 35
+      end: 41

@@ -1,0 +1,8 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="stock" initial="s">
+  <state id="s">
+    <transition event="reserve">
+      <send type="urn:test:app" target="w" event="out" />
+    </transition>
+    <transition event="reserved" />
+  </state>
+</scxml>

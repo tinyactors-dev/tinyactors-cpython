@@ -1,0 +1,5 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="worker" initial="ready">
+  <state id="ready">
+    <onentry><log label="boot" expr="_name"/></onentry>
+  </state>
+</scxml>

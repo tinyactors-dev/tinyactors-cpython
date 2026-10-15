@@ -1,0 +1,73 @@
+# No mutable state in static storage: no global and no static local the
+# extension can write (the model is mise/ast-grep/rules/tinyparse-no-static-mutable.yml
+# at the repository root). The extension is loaded once per process and
+# imported once per interpreter (PEP 489's multi-phase init, PEP 684's
+# subinterpreters), and a host is driven from any thread of the
+# free-threaded build: a global would be shared by all of them. State lives
+# in the module's state (`PyModule_GetState`, found from a method through
+# `PyType_GetModuleByDef`) or on the `Host` object.
+#
+# Allowed:
+#   - a constant: the object itself is `const` (`static const int`,
+#     `static const char *const names[]`; `static const char *p` is a
+#     mutable pointer and is refused);
+#   - a function's declaration (static linkage is not data);
+#   - CPython's tables, which its API takes by non-const pointer, so they
+#     cannot be `const`: PyMethodDef, PyMemberDef, PyGetSetDef, PyType_Slot,
+#     PyType_Spec, PyModuleDef (Include/moduleobject.h, 3.13: line 112,
+#     m_methods), PyModuleDef_Slot (the same file, 113, m_slots, for
+#     Py_mod_exec and Py_mod_gil), PyStructSequence_Desc and
+#     PyStructSequence_Field (Include/structseq.h, 3.13: lines 18 and 30,
+#     PyStructSequence_NewType). CPython reads them; we never write them.
+id: no-mutable-globals
+language: c
+severity: error
+message: "no mutable global or static local: keep state in the module's state or on the Host; constants are const objects, CPython's tables are exempt by type"
+files:
+  - src/**/*.c
+  - src/**/*.h
+utils:
+  # The declared object itself is const: `const` on the declaration and no
+  # pointer in its declarator, or `* const` next to its name.
+  const-object:
+    any:
+      - all:
+          - has: {kind: type_qualifier, regex: '^const$'}
+          - not: {has: {kind: pointer_declarator, stopBy: end}}
+      - has:
+          kind: pointer_declarator
+          stopBy: end
+          all:
+            - has: {kind: type_qualifier, regex: '^const$'}
+            - has:
+                field: declarator
+                any: [{kind: identifier}, {kind: array_declarator}]
+  # A function's declaration: its name is a function_declarator's (a
+  # pointer to a function is a variable).
+  function-declaration:
+    has:
+      kind: function_declarator
+      stopBy: end
+      has: {field: declarator, kind: identifier}
+  # by its typedef name or as `struct PyModuleDef`
+  platform-table:
+    has:
+      field: type
+      any:
+        - matches: platform-table-name
+        - {kind: struct_specifier, has: {field: name, matches: platform-table-name}}
+  platform-table-name:
+    kind: type_identifier
+    regex: '^(PyMethodDef|PyMemberDef|PyGetSetDef|PyType_Slot|PyType_Spec|PyModuleDef|PyModuleDef_Slot|PyStructSequence_Desc|PyStructSequence_Field)$'
+rule:
+  kind: declaration
+  any:
+    # file scope: outside every function body
+    - not: {inside: {kind: compound_statement, stopBy: end}}
+    # a static local
+    - has: {kind: storage_class_specifier, regex: '^static$'}
+  not:
+    any:
+      - matches: const-object
+      - matches: function-declaration
+      - matches: platform-table

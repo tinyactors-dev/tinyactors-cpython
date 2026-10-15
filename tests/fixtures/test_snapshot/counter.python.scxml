@@ -1,0 +1,27 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="counter" initial="s">
+  <datamodel>
+    <data id="n" expr="0" />
+    <data id="items" expr="[]" />
+    <data id="other" expr="0" />
+  </datamodel>
+  <state id="s">
+    <transition event="inc">
+      <assign location="n" expr="n + 1" />
+      <assign location="items" expr="items + [_event.data]" />
+    </transition>
+    <transition event="report">
+      <log label="n" expr="f'{n} {items} {_event.name} {_sessionid == str(_event.data)}'" />
+    </transition>
+    <transition event="wait">
+      <send event="late" delay="1s">
+        <content expr="{'k': n}" />
+      </send>
+    </transition>
+    <transition event="late">
+      <log label="late" expr="str(_event.data)" />
+    </transition>
+    <transition event="odd">
+      <assign location="other" expr="{1, 2}" />
+    </transition>
+  </state>
+</scxml>

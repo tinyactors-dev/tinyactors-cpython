@@ -1,0 +1,10 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="answered" initial="s">
+  <state id="s">
+    <onentry>
+      <send type="urn:test:app" target="app" event="out" />
+    </onentry>
+    <transition event="ack">
+      <log label="ack" expr="str([_event.origin, _event.origintype, _event.raw])" />
+    </transition>
+  </state>
+</scxml>

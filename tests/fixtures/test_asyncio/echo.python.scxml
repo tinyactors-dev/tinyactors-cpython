@@ -1,0 +1,21 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="echo" initial="s">
+  <state id="s">
+    <transition event="go">
+      <send type="urn:test:app" target="app" event="out">
+        <content expr="_event.data" />
+      </send>
+    </transition>
+    <transition event="ack">
+      <log label="ack" expr="str(_event.data)" />
+    </transition>
+    <transition event="error.communication">
+      <log label="failed" expr="'yes'" />
+    </transition>
+    <transition event="later">
+      <send event="tick" delay="20ms" />
+    </transition>
+    <transition event="tick">
+      <log label="tick" expr="'yes'" />
+    </transition>
+  </state>
+</scxml>

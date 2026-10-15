@@ -1,0 +1,13 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="odd" initial="s">
+  <datamodel>
+    <data id="v" expr="0" />
+  </datamodel>
+  <state id="s">
+    <transition event="odd">
+      <assign location="v" expr="{1, 2}" />
+    </transition>
+    <transition event="report">
+      <log label="v" expr="str(sorted(v))" />
+    </transition>
+  </state>
+</scxml>

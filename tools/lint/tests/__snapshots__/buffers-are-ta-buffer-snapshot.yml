@@ -1,0 +1,32 @@
+id: buffers-are-ta-buffer
+snapshots:
+  static PyObject *ta_python_decode(const uint8_t *bytes, size_t length) { return NULL; }:
+    labels:
+    - source: const uint8_t *bytes
+      style: primary
+      start: 34
+      end: 54
+  static const char *ta_python_text(PyObject *value, size_t *length) { return NULL; }:
+    labels:
+    - source: size_t *length
+      style: primary
+      start: 51
+      end: 65
+  static ta_status ta_python_encode(PyObject *value, void *buffer, size_t capacity);:
+    labels:
+    - source: void *buffer
+      style: primary
+      start: 51
+      end: 63
+  static ta_status ta_python_write(PyObject *value, char *out, uint32_t capacity) { return TA_OK; }:
+    labels:
+    - source: char *out
+      style: primary
+      start: 50
+      end: 59
+  typedef struct ta_python_store { int (*put)(void *store, const void *blob, size_t length); } ta_python_store;:
+    labels:
+    - source: const void *blob
+      style: primary
+      start: 57
+      end: 73

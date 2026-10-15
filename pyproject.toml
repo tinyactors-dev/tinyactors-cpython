@@ -1,0 +1,31 @@
+# The package's metadata (PEP 621). There is no [build-system]: the wheel,
+# one abi3 wheel (3.13+) per platform with no .py files in it, is built by
+# `mise run wheel`, as every release
+# artifact of this repository is built by a mise task (docs/adr/0001,
+# decision 2). The release sets the version.
+[project]
+name = "tinyactors"
+version = "0.1.0"
+description = "SCXML statecharts as actors, with chart logic in Python"
+readme = "README.md"
+requires-python = ">=3.13"
+license = "MIT"
+keywords = ["actor", "actors", "statechart", "scxml", "state-machine"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage = "https://github.com/dhamidi/tinyactors/tree/main/tinyactors-cpython#readme"
+Repository = "https://github.com/dhamidi/tinyactors"
+Issues = "https://github.com/dhamidi/tinyactors/issues"

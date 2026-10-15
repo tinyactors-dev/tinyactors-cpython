@@ -1,0 +1,22 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="counter" initial="s">
+  <datamodel>
+    <data id="n" expr="0" />
+    <data id="version" expr="2" />
+    <data id="seen" expr="0" />
+  </datamodel>
+  <state id="s">
+    <transition event="error.platform.upgrade">
+      <assign location="n" expr="_event.data.n" />
+      <assign location="seen" expr="Object.keys(_event.data).filter(function (k) { return _event.data[k] !== undefined; }).sort()" />
+    </transition>
+    <transition event="inc">
+      <assign location="n" expr="n + 1" />
+    </transition>
+    <transition event="report">
+      <log label="n" expr="n + ' ' + version + ' ' + JSON.stringify(seen)" />
+    </transition>
+    <transition event="later">
+      <log label="later" expr="String(n)" />
+    </transition>
+  </state>
+</scxml>

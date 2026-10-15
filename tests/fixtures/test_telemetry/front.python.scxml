@@ -1,0 +1,7 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="front" initial="s">
+  <state id="s">
+    <transition event="order">
+      <send event="reserve" targetexpr='_event.data["to"]' />
+    </transition>
+  </state>
+</scxml>

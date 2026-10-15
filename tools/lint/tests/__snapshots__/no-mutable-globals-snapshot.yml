@@ -1,0 +1,75 @@
+id: no-mutable-globals
+snapshots:
+  ? |-
+    #ifndef TA_PYTHON_EXTENSION_H
+    static int ta_python_ready;
+    #endif
+  : labels:
+    - source: static int ta_python_ready;
+      style: primary
+      start: 30
+      end: 57
+  PyObject *ta_python_host_type;:
+    labels:
+    - source: PyObject *ta_python_host_type;
+      style: primary
+      start: 0
+      end: 30
+  extern PyObject *ta_python_shared;:
+    labels:
+    - source: extern PyObject *ta_python_shared;
+      style: primary
+      start: 0
+      end: 34
+  static PyObject *ta_python_cached(void) { static PyObject *cached; return cached; }:
+    labels:
+    - source: static PyObject *cached;
+      style: primary
+      start: 42
+      end: 66
+    - source: static
+      style: secondary
+      start: 42
+      end: 48
+  static PyObject *ta_python_sleeper = NULL;:
+    labels:
+    - source: static PyObject *ta_python_sleeper = NULL;
+      style: primary
+      start: 0
+      end: 42
+  static char ta_python_scratch[256];:
+    labels:
+    - source: static char ta_python_scratch[256];
+      style: primary
+      start: 0
+      end: 35
+  static const char *ta_python_message = "call_at failed";:
+    labels:
+    - source: static const char *ta_python_message = "call_at failed";
+      style: primary
+      start: 0
+      end: 56
+  static const char *ta_python_names[] = { "call_at" };:
+    labels:
+    - source: static const char *ta_python_names[] = { "call_at" };
+      style: primary
+      start: 0
+      end: 53
+  static int (*ta_python_hook)(void);:
+    labels:
+    - source: static int (*ta_python_hook)(void);
+      style: primary
+      start: 0
+      end: 35
+  static int ta_python_count;:
+    labels:
+    - source: static int ta_python_count;
+      style: primary
+      start: 0
+      end: 27
+  static ta_python_state ta_python_state_of_the_process;:
+    labels:
+    - source: static ta_python_state ta_python_state_of_the_process;
+      style: primary
+      start: 0
+      end: 54

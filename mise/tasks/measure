@@ -1,0 +1,17 @@
+#!/usr/bin/env ruby
+#MISE description="Measure bytes per actor at 10,000 actors of one chart, resident and idle, on the \"python\" datamodel and on quickjs, with the machine's signature (tools/measure.py)"
+#MISE depends=["build"]
+#USAGE flag "--actors <n>" default="10000" help="the population"
+# vim:ft=ruby
+
+# ROADMAP.md, plan step 9: the numbers replace AGENTS.md's estimates. The
+# report gives the machine's signature beside them, and the two
+# datamodels side by side from one run (root AGENTS.md, "Benchmarks"). It
+# measures the abi3 build, the one the wheel ships, and writes
+# build/measure.json too.
+
+require_relative '../cpython'
+
+actors = ENV.fetch('usage_actors', '10000')
+CPython.run(CPython.pinned('python'), 'tools/measure.py', '--actors', actors, '--json', CPython::BUILD.join('measure.json').to_s,
+            env: { 'PYTHONPATH' => CPython::BUILD.join('abi3').to_s })

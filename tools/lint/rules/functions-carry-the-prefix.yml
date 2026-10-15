@@ -1,0 +1,28 @@
+# Every function the binding defines or declares is named ta_python_*
+# (AGENTS.md, "Names"; tinyactors-core/docs/bindings.md,
+# section 11), static helpers included. A platform's name appears only where
+# the platform requires it: the module's init function, which CPython's
+# import finds by the name PyInit_<module> (PEP 489). A slot is filled with
+# our function (Py_tp_traverse with ta_python_host_traverse); its name is
+# ours.
+id: functions-carry-the-prefix
+language: c
+severity: error
+message: "a function the binding defines or declares is named ta_python_* (only PyInit_tinyactors is the platform's)"
+files:
+  - src/**/*.c
+  - src/**/*.h
+rule:
+  kind: identifier
+  not:
+    regex: '^(ta_python_\w+|PyInit_tinyactors)$'
+  inside:
+    kind: function_declarator
+    field: declarator
+    all:
+      - not: {inside: {kind: parameter_list, stopBy: end}}
+      - inside:
+          stopBy: end
+          any:
+            - kind: function_definition
+            - kind: declaration

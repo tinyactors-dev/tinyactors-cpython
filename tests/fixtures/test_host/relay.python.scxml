@@ -1,0 +1,10 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="relay" initial="s">
+  <state id="s">
+    <transition event="go">
+      <send type="urn:test:app" target="app" event="first" />
+    </transition>
+    <transition event="ack">
+      <send type="urn:test:app" target="app" event="second" />
+    </transition>
+  </state>
+</scxml>

@@ -1,0 +1,8 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="client" initial="s">
+  <state id="s">
+    <invoke id="echo" type="urn:test:echo" src="echo://here" autoforward="true" />
+    <transition event="answer">
+      <log label="answer" expr="str(_event.data)" />
+    </transition>
+  </state>
+</scxml>

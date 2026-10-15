@@ -1,0 +1,26 @@
+id: one-timer-in-loop
+snapshots:
+  ? static PyObject *ta_python_arm(PyObject *loop, PyObject *when, PyObject *callback) { return PyObject_CallMethod(loop, "call_at", "OO", when, callback); }
+  : labels:
+    - source: '"call_at"'
+      style: primary
+      start: 118
+      end: 127
+  static PyObject *ta_python_later(PyObject *loop) { return PyObject_GetAttrString(loop, "call_later"); }:
+    labels:
+    - source: '"call_later"'
+      style: primary
+      start: 87
+      end: 99
+  static PyObject *ta_python_turn(PyObject *loop) { return PyObject_GetAttrString(loop, "call_soon"); }:
+    labels:
+    - source: '"call_soon"'
+      style: primary
+      start: 86
+      end: 97
+  static PyObject *ta_python_wait(PyObject *time) { return PyObject_GetAttrString(time, "sleep"); }:
+    labels:
+    - source: '"sleep"'
+      style: primary
+      start: 86
+      end: 93

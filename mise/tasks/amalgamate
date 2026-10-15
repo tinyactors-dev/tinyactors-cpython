@@ -1,0 +1,21 @@
+#!/usr/bin/env ruby
+#MISE description="Generate and check core's amalgamation in this binding's build/core, only when its inputs change or an output is missing"
+#MISE sources=["../tinyactors-core/include/**/*", "../tinyactors-core/src/**/*", "../tinyactors-core/third_party/**/*", "../tinyactors-core/mise/core.rb", "../tinyactors-core/mise/tasks/amalgamate", "../tinyactors-core/mise.toml", "../mise/lib/**/*", "../mise.toml", "../LICENSE", "mise/cpython.rb", "mise/tasks/amalgamate"]
+#MISE outputs=["build/core/tinyactors.h", "build/core/tinyactors.c", "build/core/tinyactors_wasm.c", "build/core/tinyactors_runtime.h", "build/core/tinyactors_runtime.c", "build/core/tinyactors_runtime_hosted.c", "build/core/tinyactors_runtime_wasm.c", "build/core/tinyactors_datamodel_ecmascript.h", "build/core/tinyactors_datamodel_ecmascript.c", "build/core/tinyactors_datamodel_ecmascript_wasm.c"]
+# vim:ft=ruby
+
+# Freshness belongs to this project's destination. Core's generator also
+# serves dist/ and the Node binding's build/core; neither is our output.
+# Run `mise run build` for normal use: its dependency runs this task before
+# compiling the extension, and its TaskStamp check forces regeneration if
+# any declared output was deleted. Direct `mise run amalgamate` is for
+# generation only; use `mise run --force amalgamate` to repair missing
+# outputs when bypassing build, because mise can otherwise skip them.
+#
+# The source list includes core's headers, implementation, vendored code,
+# generator and toolchain, plus the license embedded in generated files.
+# Binding C changes do not regenerate core. Keep the output list aligned
+# with Core::LIBRARIES if a library or platform amalgamation is added.
+require_relative '../cpython'
+
+CPython.run('mise', 'run', '//tinyactors-core:amalgamate', '--', '--out', CPython::CORE_BUILD.to_s)

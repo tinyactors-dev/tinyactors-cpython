@@ -1,0 +1,22 @@
+id: allocation-in-tables-and-host
+valid:
+  - "static void *ta_python_alloc(void *context, size_t size, size_t align) { return PyMem_RawMalloc(size); }"
+  - "static void ta_python_free(void *context, void *ptr, size_t size) { PyMem_RawFree(ptr); }"
+  - "void ta_python_host_free(ta_python_host *host) { PyMem_RawFree(host->rows); }"
+  - "static PyObject *ta_python_held(Py_ssize_t length) { return PyByteArray_FromStringAndSize(NULL, length); }"
+  - "static void ta_python_drop(ta_python_host *host) { ta_python_host_free(host); }"
+  - "static const ta_allocator ta_python_allocator = {NULL, ta_python_alloc, ta_python_free};"
+  - "void ta_python_cbor_init(ta_python_cbor *cbor) { ta_cbor_writer_init(&cbor->writer, (ta_buffer){cbor->room, sizeof cbor->room, 0}, &ta_python_allocator); }"
+  - "static int ta_python_host_build(ta_python_host *host, PyObject *config) { environment.allocator = ta_python_allocator; return 0; }"
+  - "static ta_compile_result *ta_python_compile(ta_python_host *host, const ta_python_compiling *compiling) { options.alloc = ta_python_allocator; return NULL; }"
+  - "static void ta_python_done(ta_python_cbor *cbor) { ta_python_cbor_free(cbor); }"
+invalid:
+  - "static void *ta_python_room(size_t length) { return PyMem_RawMalloc(length); }"
+  - "static void ta_python_drop(void *room) { PyMem_Free(room); }"
+  - "static char *ta_python_copy(size_t length) { return PyMem_Malloc(length); }"
+  - "static void *ta_python_object(size_t length) { return PyObject_Malloc(length); }"
+  - "static void *ta_python_libc(size_t length) { return malloc(length); }"
+  - "static void ta_python_release(void *room) { free(room); }"
+  - "static void ta_python_grow(ta_cbor_writer *writer, ta_buffer room) { ta_cbor_writer_init(writer, room, &ta_python_allocator); }"
+  - "static void ta_python_own(ta_cbor_writer *writer, ta_buffer room) { ta_cbor_writer_init(writer, room, NULL); }"
+  - "static const ta_allocator *ta_python_leak(void) { return &ta_python_allocator; }"

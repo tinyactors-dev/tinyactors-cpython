@@ -1,0 +1,36 @@
+# The datamodel (src/datamodel/) is the vtable's entries only: of core it
+# calls only what a datamodel may (AGENTS.md, "C rules": layers;
+# include/tinyactors/datamodel.h: "implementations may call the read-only
+# ta_datamodel_environment_* queries below; they must never call ta_system_*
+# functions"):
+#
+#   - ta_datamodel_environment_*: In(), fuel, the chart and its image;
+#   - ta_image_*: the chart's expressions and data, read from that image at
+#     chart_attach, as the ECMAScript datamodel does
+#     (tinyactors-core/src/datamodel_ecmascript/datamodel_ecmascript.c:979,
+#     1272);
+#   - ta_cbor_*: the token lists of to_wire and from_wire (the same file,
+#     2883 and 2995);
+#   - ta_table_*: its rows (rows.c), core's tables (AGENTS.md, "The
+#     binding's memory");
+#   - the binding's own ta_python_* (values.c's conversion).
+#
+# Never the host, the system or the compiler (ta_host_*, ta_system_*,
+# ta_compile_*, ...). Everything else it calls is CPython's API and the C
+# library functions of `extension-calls-core-and-python`, which covers
+# src/datamodel/ too.
+id: datamodel-calls-environment-and-python
+language: c
+severity: error
+message: "src/datamodel/ calls of core only ta_datamodel_environment_*, ta_image_*, ta_cbor_* and ta_table_* (and the binding's own ta_python_*)"
+files:
+  - src/datamodel/**/*.c
+  - src/datamodel/**/*.h
+rule:
+  kind: call_expression
+  has:
+    field: function
+    kind: identifier
+    regex: '^ta_'
+    not:
+      regex: '^ta_(datamodel_environment|image|cbor|table|python)_\w+$'

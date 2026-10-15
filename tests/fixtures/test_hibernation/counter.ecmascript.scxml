@@ -1,0 +1,21 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="counter" initial="s">
+  <datamodel>
+    <data id="n" expr="0" />
+    <data id="items" expr="[]" />
+  </datamodel>
+  <state id="s">
+    <transition event="inc">
+      <assign location="n" expr="n + 1" />
+      <assign location="items" expr="items.concat([_event.data])" />
+    </transition>
+    <transition event="report">
+      <log label="n" expr="n + ' ' + JSON.stringify(items) + ' ' + _event.name" />
+    </transition>
+    <transition event="last">
+      <log label="last" expr="JSON.stringify(_event.data)" />
+    </transition>
+    <transition event="wait">
+      <send event="later" delay="1s" />
+    </transition>
+  </state>
+</scxml>

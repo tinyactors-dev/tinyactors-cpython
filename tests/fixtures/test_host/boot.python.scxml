@@ -1,0 +1,11 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="booted" initial="s">
+  <state id="s">
+    <onentry>
+      <log label="booted" expr="_name or 'unnamed'" />
+      <send event="later" delay="1500ms" />
+    </onentry>
+    <transition event="later">
+      <log label="later" expr="'fired'" />
+    </transition>
+  </state>
+</scxml>

@@ -1,0 +1,14 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="pong" initial="s">
+  <datamodel>
+    <data id="n" expr="0" />
+  </datamodel>
+  <state id="s">
+    <transition event="go">
+      <send type="urn:test:app" target="app" event="ping" />
+    </transition>
+    <transition event="ack" cond="n &lt; 20000">
+      <assign location="n" expr="n + 1" />
+      <send type="urn:test:app" target="app" event="ping" />
+    </transition>
+  </state>
+</scxml>

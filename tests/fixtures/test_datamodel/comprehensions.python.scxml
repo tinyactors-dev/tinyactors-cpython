@@ -1,0 +1,13 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="c" initial="s">
+  <datamodel>
+    <data id="k" expr="10" />
+    <data id="items" expr="[1, 2]" />
+  </datamodel>
+  <state id="s">
+    <onentry>
+      <log label="l" expr="str([x * k for x in items])" />
+      <log label="g" expr="str(sum(x + k for x in items))" />
+      <log label="f" expr="f'{k}-{len(items)}'" />
+    </onentry>
+  </state>
+</scxml>

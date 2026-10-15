@@ -1,0 +1,13 @@
+id: datamodel-calls-environment-and-python
+valid:
+  - "static int ta_python_in(const ta_datamodel_call *call, uint32_t state) { return ta_datamodel_environment_in(call->environment, state); }"
+  - "static void ta_python_charge(ta_datamodel_environment *environment) { ta_datamodel_environment_charge(environment, 1); }"
+  - "static ta_status ta_python_attach(const ta_image *image, ta_chart_item item, ta_expression_info *info) { return ta_image_expression(image, item, info); }"
+  - "static ta_status ta_python_to_wire(ta_python_cbor *cbor, ta_bytes *out) { ta_cbor_write_simple(&cbor->writer, 22); return ta_cbor_writer_bytes(&cbor->writer, out); }"
+  - "static int32_t ta_python_from(ta_cbor_reader *reader, ta_bytes cbor, ta_cbor_item *item) { ta_cbor_reader_init(reader, cbor); return ta_cbor_read(reader, item); }"
+  - "static PyObject *ta_python_eval(PyObject *code, PyObject *globals) { return PyEval_EvalCode(code, globals, NULL); }"
+  - "static void *ta_python_row(ta_table *table, uint64_t handle) { return ta_table_get(table, handle); }"
+invalid:
+  - "static void ta_python_sneak(ta_host *host, uint64_t session) { ta_host_send(host, NULL); }"
+  - "static void ta_python_peek(ta_system *system) { ta_system_run(system, 1); }"
+  - "static void ta_python_compile(void) { ta_compile_charts(NULL, NULL, NULL); }"

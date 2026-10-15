@@ -1,0 +1,15 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="c" initial="s">
+  <datamodel>
+    <data id="n" expr="0" />
+  </datamodel>
+  <state id="s">
+    <transition event="go">
+      <script>while True:
+    n = n + 1
+</script>
+    </transition>
+    <transition event="error.execution">
+      <log label="e" expr="'execution'" />
+    </transition>
+  </state>
+</scxml>

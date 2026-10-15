@@ -1,0 +1,19 @@
+#!/usr/bin/env ruby
+#MISE description="Invoked services under load: every actor invokes a service the application runs, talks to it, and ends it (done, cancelled, kept), on both datamodels (tools/services.py)"
+#MISE depends=["build"]
+#USAGE flag "--actors <n>" default="200000" help="the actors, each with an invoked service"
+#USAGE flag "--events <n>" default="1000000" help="the round trips (actor -> service -> actor)"
+# vim:ft=ruby
+
+# The application's side of invoked services as a program writes it:
+# Host(services={type: handler}), one service object per invocation,
+# send_back and done, receive and stop. It fails when a pong is lost or
+# doubled, when a finished client's done data is wrong, when a cancelled
+# service is not stopped exactly once (or another is), or when the host
+# holds a service that ended. `mise run test --full` runs it at its
+# defaults; the fast pass runs a small one.
+
+require_relative '../cpython'
+
+CPython.stress(actors: ENV.fetch('usage_actors', '200000'), events: ENV.fetch('usage_events', '1000000'),
+               tool: 'services')

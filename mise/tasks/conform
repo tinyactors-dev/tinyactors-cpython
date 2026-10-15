@@ -1,0 +1,38 @@
+#!/usr/bin/env ruby
+#MISE description="Run the conformance suite against the adapter (python -m conform) as a binding (--kind binding), on the native datamodel and on quickjs; arguments go to the runner (--suite protocol, ...)"
+#USAGE arg "[argument]..." var=#true help="options for the runner: --milestone, --suite, --timeout, --skip (tinyactors-test/README.md)"
+# vim:ft=ruby
+
+# The differential run (AGENTS.md, "Tasks"): the same suite on the
+# native "python" datamodel and on quickjs, and both must pass. The kind is
+# stated here, by the project that runs the suite, not by the adapter
+# (tinyactors-test/docs/driver.md, "Kinds"). The adapter runs on the pinned
+# interpreter, by path: the runner is tinyactors-test's task, whose PATH has
+# its own python first.
+#
+# The adapter imports the built extension as `tinyactors`; put it on
+# the import path here (PYTHONPATH), never in the adapter, whose lint
+# refuses `sys.path` (tinyactors-test/lint). It reads and writes the
+# driver's frames with the module's own `tinyactors.encode` and
+# `tinyactors.decode`, and imports nothing but `tinyactors` and the
+# standard library (the same lint). Without --milestone the whole suite
+# runs; `mise run test` passes `--milestone CPython::MILESTONE`.
+
+require_relative '../cpython'
+
+unless CPython::ADAPTER.exist?
+  abort "conform: no adapter yet: #{CPython::ADAPTER.relative_path_from(CPython::ROOT)}/ " \
+        '(python -m conform)'
+end
+
+# The datamodels: both, unless TA_PYTHON_DATAMODELS names fewer (`mise
+# run test` passes the gate's, CPython::GATE). The adapter imports the
+# abi3 build, the one the wheel ships.
+python = CPython.pinned('python')
+options = ARGV.reject { |argument| argument == '--' }
+datamodels = ENV.fetch('TA_PYTHON_DATAMODELS', 'native,quickjs').split(',')
+datamodels.each do |datamodel|
+  puts "conform: #{datamodel}"
+  CPython.run('mise', 'run', '//tinyactors-test:run', '--', '--kind', 'binding', '--datamodel', datamodel, *options,
+              python, '-m', 'conform', env: { 'PYTHONPATH' => CPython::BUILD.join('abi3').to_s })
+end

@@ -1,0 +1,15 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="ecmascript" name="fit" initial="idle">
+  <datamodel>
+    <data id="count" expr="0" />
+    <data id="label" expr="'actor'" />
+    <data id="items" expr="[]" />
+  </datamodel>
+  <state id="idle">
+    <transition event="inc" cond="count &lt; 100">
+      <assign location="count" expr="count + 1" />
+    </transition>
+    <transition event="add">
+      <script>items.push(_event.data)</script>
+    </transition>
+  </state>
+</scxml>

@@ -1,0 +1,13 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="c" initial="s">
+  <datamodel>
+    <data id="k" expr="1" />
+  </datamodel>
+  <state id="s">
+    <onentry>
+      <log label="v" expr="lambda: 1" />
+    </onentry>
+    <transition event="error.execution">
+      <log label="e" expr="'refused'" />
+    </transition>
+  </state>
+</scxml>

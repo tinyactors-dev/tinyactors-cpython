@@ -1,0 +1,5 @@
+<system>
+  <chart name="worker" src="worker.scxml"/>
+  <actor name="first" chart="worker"/>
+  <actor name="second" chart="worker"/>
+</system>

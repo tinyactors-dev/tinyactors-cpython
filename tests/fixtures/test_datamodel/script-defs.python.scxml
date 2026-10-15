@@ -1,0 +1,16 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="c" initial="s">
+  <datamodel>
+    <data id="bonus" expr="1" />
+    <data id="result" />
+  </datamodel>
+  <script>def double(x):
+    total = x * 2
+    return total + bonus
+</script>
+  <state id="s">
+    <onentry>
+      <script>result = double(4)</script>
+      <log label="r" expr="str(result)" />
+    </onentry>
+  </state>
+</scxml>

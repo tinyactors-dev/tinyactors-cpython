@@ -1,0 +1,21 @@
+id: extension-calls-core-and-python
+valid:
+  - "static void ta_python_turn(ta_host *host) { ta_host_run(host, 1000); ta_host_effects_ack(host); }"
+  - "static PyObject *ta_python_error(void) { PyErr_SetString(PyExc_ValueError, \"x\"); return NULL; }"
+  - "static void ta_python_drop(PyObject *object) { Py_DECREF(object); Py_XINCREF(object); }"
+  - "static void *ta_python_allocate(void *context, size_t size, size_t alignment) { return PyMem_RawMalloc(size); }"
+  - "static void ta_python_release(void *context, void *pointer, size_t size) { PyMem_RawFree(pointer); }"
+  - "static void ta_python_copy(char *a, const char *b, size_t n) { memcpy(a, b, n); memset(a, 0, strlen(b)); }"
+  - "static void ta_python_check(void) { assert(sizeof(int) == 4); size_t at = offsetof(ta_spawn, size); }"
+  - "static void ta_python_vtable(const ta_datamodel_call *call) { call->datamodel->release(call); }"
+  - "static PyObject *ta_python_item(PyObject *dict, PyObject *key) { PyObject *value; PyDict_GetItemRef(dict, key, &value); return value; }"
+invalid:
+  - "static void *ta_python_allocate(size_t size) { return malloc(size); }"
+  - "static void ta_python_release(void *pointer) { free(pointer); }"
+  - "static void *ta_python_zeroed(size_t size) { return calloc(1, size); }"
+  - "static void *ta_python_grow(void *pointer, size_t size) { return realloc(pointer, size); }"
+  - "static void ta_python_log(const char *text) { printf(\"%s\", text); }"
+  - "static void ta_python_track(PyObject *object) { _PyObject_GC_TRACK(object); }"
+  - "static void ta_python_eval(JSContext *context) { JS_Eval(context, \"1\", 1, \"x\", 0); }"
+  - "static void ta_python_wait(void) { usleep(1000); }"
+  - "static uint64_t ta_python_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return 0; }"

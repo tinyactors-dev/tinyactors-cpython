@@ -1,0 +1,32 @@
+#!/usr/bin/env ruby
+#MISE description="Build the wheels: one abi3 wheel (3.13+) per native release target, with zig, checked by its symbols, into build/wheels/; this machine's is installed into fresh environments (3.13, 3.14) and smoke-tested there"
+#MISE depends=["amalgamate"]
+#USAGE arg "[target]" var=#true help="Release targets to build (aarch64-macos, x86_64-macos, x86_64-linux, aarch64-linux); all of them when none is named"
+# vim:ft=ruby
+
+# mise run wheel                     every target's wheel, and this machine's smoke-tested
+# mise run wheel -- x86_64-linux     one target's
+#
+# The version is pyproject.toml's (0.0.0 between releases: the release task
+# sets it). Nothing is published: `mise run release` builds, checks and
+# publishes (docs/adr/0001, decisions 21 to 24; mise/wheel.rb).
+
+require_relative '../wheel'
+require 'task_stamp'
+
+force = TaskStamp.force(CPython::ROOT, 'amalgamate')
+CPython.run('mise', 'run', *force, 'amalgamate') unless force.empty?
+
+names = ARGV.empty? ? CPython::Wheel.target_names : ARGV
+unknown = names - CPython::Wheel.target_names
+abort "wheel: no such target: #{unknown.join(', ')}; one of #{CPython::Wheel.target_names.join(', ')}" unless unknown.empty?
+
+out = CPython::BUILD.join('wheels')
+FileUtils.rm_rf(out)
+wheels = CPython::Wheel.build_all(names, version: CPython::Wheel.project.fetch('version'), out: out)
+here = wheels[Toolchain::Host.current.target.name]
+if here
+  CPython::Wheel.smoke_here!(here, tests: false)
+else
+  puts "wheel: this machine's target (#{Toolchain::Host.current.target}) was not built: no smoke test"
+end

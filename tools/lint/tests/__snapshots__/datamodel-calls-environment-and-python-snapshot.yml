@@ -1,0 +1,32 @@
+id: datamodel-calls-environment-and-python
+snapshots:
+  static void ta_python_compile(void) { ta_compile_charts(NULL, NULL, NULL); }:
+    labels:
+    - source: ta_compile_charts(NULL, NULL, NULL)
+      style: primary
+      start: 38
+      end: 73
+    - source: ta_compile_charts
+      style: secondary
+      start: 38
+      end: 55
+  static void ta_python_peek(ta_system *system) { ta_system_run(system, 1); }:
+    labels:
+    - source: ta_system_run(system, 1)
+      style: primary
+      start: 48
+      end: 72
+    - source: ta_system_run
+      style: secondary
+      start: 48
+      end: 61
+  static void ta_python_sneak(ta_host *host, uint64_t session) { ta_host_send(host, NULL); }:
+    labels:
+    - source: ta_host_send(host, NULL)
+      style: primary
+      start: 63
+      end: 87
+    - source: ta_host_send
+      style: secondary
+      start: 63
+      end: 75

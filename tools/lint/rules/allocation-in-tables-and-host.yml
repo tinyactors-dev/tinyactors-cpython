@@ -1,0 +1,96 @@
+# The binding allocates almost nothing (AGENTS.md, "The binding's memory";
+# tinyactors-core/docs/bindings.md, section 6, "The binding allocates
+# almost nothing"): it borrows what core or Python already holds, holds a
+# Python object instead of copying bytes, and keeps what core cannot hold
+# as rows of core's tables (ta_table) and its call scratch in core's arena
+# (ta_growable_arena), both of which grow through the host's allocator.
+# So an allocator is called in one place only: src/host.c's allocator
+# (ta_python_alloc, ta_python_free), which core calls for every block of
+# the host, its tables and its arena (ta_python_host_new and
+# ta_python_host_free may call one too, and call none today). A block the
+# datamodel keeps between calls (to_wire's output) is given back through
+# the host's ta_allocator struct, a call through a pointer.
+#
+# Everywhere else a call to CPython's allocators (PyMem_*, PyObject_Malloc
+# and its kin) or the C library's (malloc, calloc, realloc, free, ...) is
+# refused. Python objects (a bytes, a bytearray) are not this rule's: they
+# are the objects the binding holds.
+#
+# The host's allocator (ta_python_allocator) reaches core in three places
+# only: the host's environment (ta_python_host_build), the compiler's
+# options (ta_python_compile), and a call's CBOR writer
+# (ta_python_cbor_init), which grows through it, or through the allocator
+# it is given (the arena's view, the host's struct), when a value
+# outgrows its room (docs/adr/0010 in the repository root, decision 4).
+# Any other use of it is refused, and so is a writer started anywhere but
+# there (ta_cbor_writer_init).
+id: allocation-in-tables-and-host
+language: c
+severity: error
+message: "allocation happens only in the host's allocator (src/host.c), which core's tables, arena and a call's writer (ta_python_cbor_init) grow through: borrow, hold a Python object, or use a table row or the call's arena"
+files:
+  - src/**/*.c
+  - src/**/*.h
+rule:
+  any:
+    - matches: allocation-call
+    - matches: allocator-elsewhere
+    - matches: writer-elsewhere
+utils:
+  allocation-call:
+    kind: call_expression
+    has:
+      field: function
+      kind: identifier
+      regex: '^(PyMem_\w+|PyObject_(Malloc|Calloc|Realloc|Free)|malloc|calloc|realloc|free|aligned_alloc|posix_memalign|strdup|strndup)$'
+    not:
+      inside:
+        kind: function_definition
+        stopBy: end
+        has:
+          field: declarator
+          any:
+            - kind: function_declarator
+              has: {field: declarator, regex: '^ta_python_(alloc|free|host_new|host_free)$'}
+            - kind: pointer_declarator
+              has:
+                field: declarator
+                kind: function_declarator
+                has: {field: declarator, regex: '^ta_python_(alloc|free|host_new|host_free)$'}
+  allocator-elsewhere:
+    kind: identifier
+    regex: '^ta_python_allocator$'
+    not:
+      any:
+        - inside: {kind: init_declarator, inside: {kind: declaration, inside: {kind: translation_unit}}}
+        - inside:
+            kind: function_definition
+            stopBy: end
+            has:
+              field: declarator
+              kind: function_declarator
+              has: {field: declarator, regex: '^ta_python_(host_build|compile|cbor_init)$'}
+        - inside:
+            kind: function_definition
+            stopBy: end
+            has:
+              field: declarator
+              kind: pointer_declarator
+              has:
+                field: declarator
+                kind: function_declarator
+                has: {field: declarator, regex: '^ta_python_(host_build|compile|cbor_init)$'}
+  writer-elsewhere:
+    kind: call_expression
+    has:
+      field: function
+      kind: identifier
+      regex: '^ta_cbor_writer_init$'
+    not:
+      inside:
+        kind: function_definition
+        stopBy: end
+        has:
+          field: declarator
+          kind: function_declarator
+          has: {field: declarator, regex: '^ta_python_cbor_init$'}

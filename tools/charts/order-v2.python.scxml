@@ -1,0 +1,44 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="order" initial="open">
+  <datamodel>
+    <data id="n" expr="0" />
+    <data id="last" expr="None" />
+    <data id="late" expr="0" />
+    <data id="paid" expr="-1" />
+    <data id="version" expr="2" />
+  </datamodel>
+  <state id="order" initial="open">
+    <transition event="error.platform.upgrade">
+      <assign location="n" expr="_event.data['n']" />
+      <assign location="last" expr="_event.data['last']" />
+      <assign location="late" expr="_event.data['late']" />
+      <assign location="paid" expr="_event.data['paid']" />
+    </transition>
+    <transition event="inc">
+      <assign location="n" expr="n + 1" />
+      <assign location="last" expr="_event.data" />
+    </transition>
+    <transition event="wait">
+      <send event="late" delay="10s" />
+    </transition>
+    <transition event="late">
+      <assign location="late" expr="late + 1" />
+    </transition>
+    <transition event="report">
+      <log label="report" expr="f'{_sessionid} {n} {late} {paid} {version}'" />
+    </transition>
+    <state id="open">
+      <transition event="pay" target="paying" />
+    </state>
+    <state id="paying">
+      <invoke id="payment" type="urn:example:payment" src="payment://live">
+        <param name="amount" expr="n" />
+      </invoke>
+      <transition event="paid" target="open">
+        <assign location="paid" expr="1" />
+      </transition>
+      <transition event="declined" target="open">
+        <assign location="paid" expr="0" />
+      </transition>
+    </state>
+  </state>
+</scxml>

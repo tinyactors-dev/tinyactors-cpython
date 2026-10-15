@@ -1,0 +1,20 @@
+# One timer, in src/loop.c (AGENTS.md, "C rules": layers;
+# tinyactors-core/docs/bindings.md, section 3: "One timer, re-armed after
+# every loop; never one per actor or per deadline"). The loop's wakes go
+# through the event loop's methods or the synchronous driver's sleep, which
+# the extension reaches by name: `loop.call_at`, `loop.call_later`,
+# `loop.call_soon` (a turn after TA_RUN_YIELDED), `call_soon_threadsafe`,
+# `time.sleep`. Their names appear in src/loop.c only. That there is one
+# TimerHandle at a time is the loop's own test.
+id: one-timer-in-loop
+language: c
+severity: error
+message: "the loop's timer and wakes (call_at, call_later, call_soon, sleep) live in src/loop.c only"
+files:
+  - src/**/*.c
+  - src/**/*.h
+ignores:
+  - src/loop.c
+rule:
+  kind: string_literal
+  regex: '^"(call_at|call_later|call_soon|call_soon_threadsafe|sleep)"$'

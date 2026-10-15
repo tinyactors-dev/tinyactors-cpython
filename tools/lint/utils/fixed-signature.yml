@@ -1,0 +1,27 @@
+# The parameter list of a function whose signature a typedef fixes, so its
+# parameters are not ours to group (AGENTS.md, "C rules":
+# exempt by that typedef, not by name). It is matched by the
+# parameter types, whatever the function and its parameters are called:
+#
+#   - PyCMethod, a METH_METHOD | METH_FASTCALL | METH_KEYWORDS method:
+#     (PyObject *, PyTypeObject *, PyObject *const *, size_t, PyObject *)
+#     (CPython's Include/methodobject.h, 3.13: line 26);
+#   - PyCFunctionFastWithKeywords, a METH_FASTCALL | METH_KEYWORDS
+#     function: (PyObject *, PyObject *const *, Py_ssize_t, PyObject *)
+#     (Include/methodobject.h, 3.13: line 23);
+#   - ta_allocator's alloc and free, which the host's allocator fills
+#     (tinyactors-core/tools/lint/utils/allocator-signature.yml).
+#
+# Every other CPython typedef a binding fills (slots: tp_traverse,
+# tp_clear, tp_dealloc, getters, setters, Py_mod_exec) takes at most three
+# parameters and no pointer and length, so it needs no exemption. Add one
+# here, with its header line, before a function that a typedef fixes fails
+# a rule.
+id: fixed-signature
+language: c
+rule:
+  kind: parameter_list
+  any:
+    - regex: '^\(\s*PyObject\s*\*\s*\w*\s*,\s*PyTypeObject\s*\*\s*\w*\s*,\s*PyObject\s*\*\s*const\s*\*\s*\w*\s*,\s*size_t\s+\w*\s*,\s*PyObject\s*\*\s*\w*\s*\)$'
+    - regex: '^\(\s*PyObject\s*\*\s*\w*\s*,\s*PyObject\s*\*\s*const\s*\*\s*\w*\s*,\s*Py_ssize_t\s+\w*\s*,\s*PyObject\s*\*\s*\w*\s*\)$'
+    - matches: allocator-signature

@@ -1,0 +1,7 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="c" initial="s">
+  <state id="s">
+    <transition event="go">
+      <log label="e" expr="str((_event.name, _event.type, _event.sendid, _event.data))" />
+    </transition>
+  </state>
+</scxml>

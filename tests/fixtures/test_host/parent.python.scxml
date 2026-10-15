@@ -1,0 +1,8 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="parent" initial="s">
+  <state id="s">
+    <invoke srcexpr="'missing.scxml'" />
+    <transition event="error.execution">
+      <log label="refused" expr="'yes'" />
+    </transition>
+  </state>
+</scxml>

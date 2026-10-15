@@ -1,0 +1,11 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="client" initial="s">
+  <state id="s">
+    <invoke id="echo" type="urn:test:echo" src="echo://here" />
+    <transition event="leave" target="over" />
+  </state>
+  <state id="over">
+    <transition event="error.communication">
+      <log label="error" expr="'late'" />
+    </transition>
+  </state>
+</scxml>
