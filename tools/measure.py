@@ -61,7 +61,7 @@ def resident():
 
 def region(host):
     got = []
-    host.host_stats(lambda host, result: got.append(result["host"]["regionBytes"]))
+    host.host_stats(lambda result: got.append(result["host"]["regionBytes"]))
     host.run_until_idle()
     return got[0]
 
@@ -69,11 +69,10 @@ def region(host):
 def measure(datamodel, actors):
     # every pool sized for the population, so nothing grows: a segment that grows doubles every
     # pool (quickjs keeps each actor's last event, so maxEvents counts the actors); tracing off
-    config = {"systemID": "measure", "system": {"maxActors": actors + 16, "maxEvents": actors + 4096,
-                                                "tracing": False}}
-    with tinyactors.Host(config) as host:
-        with tinyactors.compile_charts([("fit.scxml", read_chart("fit", datamodel))]) as compiled:
-            host.add_image(compiled.image)
+    config = {"system": {"maxActors": actors + 16, "maxEvents": actors + 4096, "tracing": False}}
+    with tinyactors.compile_charts([("fit.scxml", read_chart("fit", datamodel))]) as compiled:
+        image = compiled.image
+    with tinyactors.Host(image, system="measure", config=config) as host:
         chart = host.chart("fit")
         warm = host.spawn(chart)  # the chart's code attached and warmed
         host.run_until_idle()
@@ -81,7 +80,7 @@ def measure(datamodel, actors):
         host.run_until_idle()
         tracemalloc.start()
         before = (resident(), tracemalloc.get_traced_memory()[0], region(host))
-        sessions = array.array("Q", (host.spawn(chart) for _ in range(actors)))  # 8 B an actor, in traced
+        sessions = array.array("Q", (host.spawn(chart).id for _ in range(actors)))  # 8 B an actor, in traced
         host.run_until_idle()
         after = (resident(), tracemalloc.get_traced_memory()[0], region(host))
         for first in range(0, actors, 256):  # one event each: each keeps its _event

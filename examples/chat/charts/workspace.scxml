@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A workspace: the collection actor that decides which rooms exist. It
+     never ends; with the host's store it hibernates when idle, and core
+     wakes it when an event comes for its name (strategy A). -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       name="workspace" datamodel="python" initial="ready">
+  <script src="workspace.py"/>
+  <datamodel>
+    <data id="id"/>
+    <data id="owners" expr="[]"/>
+    <data id="rooms" expr="[]"/>          <!-- the names of its rooms -->
+    <data id="creating" expr="{}"/>       <!-- spawn sendid -> {name, origin}: who asked -->
+    <data id="sendid"/>
+  </datamodel>
+  <state id="ready">
+    <transition event="room.create" cond="may_create(owners, rooms, creating, _event)">
+      <send type="spawn" event="spawn" idlocation="sendid">
+        <content expr="room_spawn(id, _event)"/>
+      </send>
+      <assign location="creating" expr="with_entry(creating, sendid, request(_event))"/>
+    </transition>
+    <transition event="room.create">
+      <send targetexpr="_event.origin" event="room.refused">
+        <content expr="refusal(owners, rooms, creating, _event)"/>
+      </send>
+    </transition>
+    <!-- the Spawner's answer: the room exists; tell who asked -->
+    <transition event="spawned" cond="_event.sendid in creating">
+      <assign location="rooms" expr="added(rooms, creating[_event.sendid]['name'])"/>
+      <send targetexpr="creating[_event.sendid]['origin']" event="room.created">
+        <content expr="{'room': creating[_event.sendid]['name']}"/>
+      </send>
+      <assign location="creating" expr="without_entry(creating, _event.sendid)"/>
+    </transition>
+    <transition event="error.communication" cond="_event.sendid in creating">
+      <send targetexpr="creating[_event.sendid]['origin']" event="room.refused">
+        <content expr="{'name': creating[_event.sendid]['name'], 'reason': 'spawn failed'}"/>
+      </send>
+      <assign location="creating" expr="without_entry(creating, _event.sendid)"/>
+    </transition>
+    <!-- every room announces itself when it starts, also the ones the
+         application spawns at startup from the database -->
+    <transition event="room.opened">
+      <assign location="rooms" expr="added(rooms, _event.data['name'])"/>
+    </transition>
+    <transition event="rooms">            <!-- an ask: the reply goes to _event.origin -->
+      <send targetexpr="_event.origin" event="rooms"><content expr="{'rooms': sorted(rooms)}"/></send>
+    </transition>
+  </state>
+</scxml>

@@ -1,7 +1,9 @@
-"""Hibernation: sweep, hibernate, the WAKE handler and wake, on both datamodels."""
+"""Hibernation: the store and the resident bound, and the operator's
+sweep, hibernate and wake, on both datamodels."""
 
-import asyncio
 import gc
+import os
+import tempfile
 import unittest
 
 import tinyactors
@@ -11,31 +13,38 @@ COUNTER = {datamodel: fixture("test_hibernation/counter.%s.scxml" % datamodel) f
 
 
 class Store:
-    """A WAKE handler over a dict, as an application's store would be."""
+    """A store over a dict that records the sessions the host loads."""
 
     def __init__(self):
         self.blobs = {}
         self.wakes = []
 
-    def __call__(self, host, session, migration):
+    def save(self, session, blob):
+        self.blobs[session] = blob
+
+    def load(self, session):
         self.wakes.append(session)
-        host.wake(session, self.blobs.pop(session))
+        return self.blobs[session]
+
+    def delete(self, session):
+        self.blobs.pop(session, None)
 
 
 class Hibernation(unittest.TestCase):
     def roundtrip(self, datamodel):
         logs, store = Logs(), Store()
-        with host_with([("counter.scxml", COUNTER[datamodel])], log=logs, wake=store) as host:
+        with host_with([("counter.scxml", COUNTER[datamodel])], log=logs, store=store) as host:
             session = host.spawn(host.chart("counter"))
             host.send(session, "inc", {"k": 1})
             host.send(session, "inc", "two")
             host.run_until_idle()
             blob = host.hibernate(session)
             self.assertIsInstance(blob, bytes)
-            store.blobs[session] = blob
+            store.save(session.id, blob)
             host.send(session, "report")
             host.run_until_idle()
-            self.assertEqual(store.wakes, [session])
+            self.assertEqual(store.wakes, [session.id])
+            self.assertEqual(store.blobs, {}, "the blob is spent once the actor is back")
         return logs.labelled("n")
 
     def test_a_python_actor_wakes_with_its_variables(self):
@@ -56,7 +65,7 @@ class Hibernation(unittest.TestCase):
                 document = load("test_hibernation/counter.%s.scxml" % datamodel)
                 on_exit = element("onexit", element("log", label="exit", expr=exits[datamodel]))
                 find(document, "state[@id='s']").insert(0, on_exit)
-                with host_with([("counter.scxml", text(document))], log=logs, wake=store) as host:
+                with host_with([("counter.scxml", text(document))], log=logs, store=store) as host:
                     session = host.spawn(host.chart("counter"))
                     host.send(session, "inc", {"k": 7})
                     host.run_until_idle()
@@ -67,11 +76,10 @@ class Hibernation(unittest.TestCase):
                 self.assertEqual(logs.labelled("exit"), [expected])
 
     def test_events_wait_until_the_wake(self):
-        """One WAKE per hibernation, however many events come; they run in
-        order once the application wakes the actor."""
+        """Without a store, an actor hibernated by the operator stays so: its
+        events wait, and run in order once the application wakes it."""
         logs = Logs()
-        wakes = []
-        with host_with([("counter.scxml", COUNTER["python"])], log=logs, wake=lambda host, s, migration: wakes.append(s)) as host:
+        with host_with([("counter.scxml", COUNTER["python"])], log=logs) as host:
             session = host.spawn(host.chart("counter"))
             host.run_until_idle()
             blob = host.hibernate(session)
@@ -79,7 +87,6 @@ class Hibernation(unittest.TestCase):
                 host.send(session, "inc", i)
             host.send(session, "report")
             host.run_until_idle()
-            self.assertEqual(wakes, [session])
             self.assertEqual(logs.labelled("n"), [])
             host.wake(session, blob)
             host.run_until_idle()
@@ -94,7 +101,7 @@ class Hibernation(unittest.TestCase):
             host.send(sessions[1], "inc", 0)
             host.run_until_idle()
             cold = host.sweep(1024, 16)
-            self.assertEqual(sorted(cold), sorted(sessions[:1] + sessions[2:]))
+            self.assertEqual(sorted(cold), sorted(actor.id for actor in sessions[:1] + sessions[2:]))
             self.assertEqual(len(host.sweep(1024, 2)), 2)
 
     def test_a_delayed_send_wakes_the_actor_it_was_sent_to(self):
@@ -106,16 +113,16 @@ class Hibernation(unittest.TestCase):
         document = load("test_hibernation/counter.python.scxml")
         later = element("transition", element("log", label="later", expr="str(n)"), event="later")
         find(document, "state[@id='s']").append(later)
-        with host_with([("counter.scxml", text(document))], log=logs, wake=store, clock=clock) as host:
+        with host_with([("counter.scxml", text(document))], log=logs, store=store, clock=clock) as host:
             session = host.spawn(host.chart("counter"))
             host.send(session, "inc", 0)
             host.send(session, "wait")
             host.run_until_idle()
-            store.blobs[session] = host.hibernate(session)
+            store.save(session.id, host.hibernate(session))
             clock.increment(0.999)
             self.assertEqual(store.wakes, [])
             clock.increment(0.001)
-            self.assertEqual(store.wakes, [session])
+            self.assertEqual(store.wakes, [session.id])
         self.assertEqual(logs.labelled("later"), ["1"])
 
     def test_hibernate_refuses_an_actor_with_events_waiting(self):
@@ -161,6 +168,48 @@ class Hibernation(unittest.TestCase):
                 host.hibernate(session)
             self.assertEqual(instances(), 1)
 
+    def test_wake_refuses_an_older_blob(self):
+        """A store that fell behind hands back an earlier blob: the wake
+        refuses it with TA_ERROR_STALE and the actor stays hibernated, then
+        wakes from the latest one with its state."""
+        for datamodel in ("python", "ecmascript"):
+            with self.subTest(datamodel=datamodel):
+                logs = Logs()
+                with host_with([("counter.scxml", COUNTER[datamodel])], log=logs) as host:
+                    session = host.spawn(host.chart("counter"))
+                    host.run_until_idle()
+                    older = host.hibernate(session)
+                    host.wake(session, older)
+                    host.send(session, "inc", 1)
+                    host.run_until_idle()
+                    latest = host.hibernate(session)
+                    with self.assertRaises(tinyactors.TinyactorsError) as raised:
+                        host.wake(session, older)
+                    self.assertEqual(raised.exception.status, "TA_ERROR_STALE")
+                    host.wake(session, latest)
+                    host.send(session, "report")
+                    host.run_until_idle()
+                self.assertEqual(logs.labelled("n")[0].split(" ")[0], "1")
+
+    def test_wake_refuses_a_blob_of_another_host(self):
+        """Two hosts of one config and one image, each with a session of the
+        same number hibernated: neither wakes the other's blob
+        (TA_ERROR_INVALID, the host's identity differs), and each wakes its
+        own."""
+        source = [("counter.scxml", COUNTER["python"])]
+        with host_with(source) as first, host_with(source) as second:
+            sessions, blobs = [], []
+            for host in (first, second):
+                sessions.append(host.spawn(host.chart("counter")))
+                host.run_until_idle()
+                blobs.append(host.hibernate(sessions[-1]))
+            self.assertEqual(sessions[0].id, sessions[1].id)
+            for host, other, own in ((first, blobs[1], blobs[0]), (second, blobs[0], blobs[1])):
+                with self.assertRaises(tinyactors.TinyactorsError) as raised:
+                    host.wake(sessions[0], other)
+                self.assertEqual(raised.exception.status, "TA_ERROR_INVALID")
+                host.wake(sessions[0], own)
+
     def test_wake_refuses_a_blob_it_cannot_read(self):
         with host_with([("counter.scxml", COUNTER["python"])]) as host:
             session = host.spawn(host.chart("counter"))
@@ -169,11 +218,12 @@ class Hibernation(unittest.TestCase):
             with self.assertRaises(tinyactors.TinyactorsError):
                 host.wake(session, b"\x00not a blob")
 
-    def test_a_wake_handler_that_raises_is_raised_by_the_driver(self):
-        def wake(host, session, migration):
-            raise ValueError("store down")
+    def test_a_store_that_raises_is_raised_by_the_driver(self):
+        class Down(Store):
+            def load(self, session):
+                raise ValueError("store down")
 
-        with host_with([("counter.scxml", COUNTER["python"])], wake=wake) as host:
+        with host_with([("counter.scxml", COUNTER["python"])], store=Down()) as host:
             session = host.spawn(host.chart("counter"))
             host.run_until_idle()
             host.hibernate(session)
@@ -186,12 +236,12 @@ class Hibernation(unittest.TestCase):
         the blob's batch is acknowledged there, and the next run is not
         refused."""
         logs, store = Logs(), Store()
-        with host_with([("counter.scxml", COUNTER["python"])], log=logs, wake=store) as host:
+        with host_with([("counter.scxml", COUNTER["python"])], log=logs, store=store) as host:
             a, b = host.spawn(host.chart("counter")), host.spawn(host.chart("counter"))
             host.run_until_idle()
 
             def items():
-                store.blobs[a] = host.hibernate(a)
+                store.save(a.id, host.hibernate(a))
                 yield (b, "inc", 1)
 
             self.assertEqual(host.send_many(items()), 1)
@@ -206,12 +256,12 @@ class Hibernation(unittest.TestCase):
         were never dispatched."""
         replies = [0]
 
-        def again(host, result):
+        def again(result):
             replies[0] += 1
             if replies[0] < 200:
                 host.host_stats(again)
 
-        def boom(host, result):
+        def boom(result):
             raise RuntimeError("stop the driver")
 
         with host_with([("counter.scxml", COUNTER["python"])]) as host:
@@ -233,38 +283,117 @@ class Hibernation(unittest.TestCase):
             with self.assertRaises(OverflowError):
                 host.wake(-1, b"")
 
-    def test_an_async_wake_handler_under_with_raises_type_error(self):
-        async def wake(host, session, migration):
-            pass
 
-        with self.assertRaisesRegex(TypeError, "wake"):
-            with tinyactors.Host({"systemID": "t"}, wake=wake):
-                pass
 
-    def test_an_async_wake_handler_runs_as_a_task(self):
-        logs, blobs = Logs(), {}
+class Resident(unittest.TestCase):
+    """store= and resident=: after a turn that leaves more actors in memory
+    than the bound, the host hibernates the surplus into the store, and a
+    WAKE loads them back."""
 
-        async def wake(host, session, migration):
-            await asyncio.sleep(0)
-            host.wake(session, blobs.pop(session))
+    def resident(self, host):
+        got = []
+        host.host_stats(lambda result: got.append(result["host"]))
+        host.run_until_idle()
+        return got[0]["actors"] - got[0]["hibernated"]
 
-        async def main():
-            config = {"systemID": "t", "ioProcessors": [{"type": APP}]}
-            async with tinyactors.Host(config, log=logs, wake=wake) as host:
-                with tinyactors.compile_charts([("counter.scxml", COUNTER["python"])]) as compiled:
-                    host.add_image(compiled.image)
-                session = host.spawn(host.chart("counter"))
-                await host.idle()
-                blobs[session] = host.hibernate(session)
-                host.send(session, "inc", 5)
-                host.send(session, "report")
-                await host.idle()
-                for _ in range(5):
-                    await asyncio.sleep(0)
-                await host.idle()
+    def population(self, datamodel, store):
+        logs = Logs()
+        with host_with([("counter.scxml", COUNTER[datamodel])], log=logs, store=store, resident=3) as host:
+            actors = [host.spawn("counter") for _ in range(10)]
+            host.run_until_idle()
+            self.assertLessEqual(self.resident(host), 3)
+            self.assertEqual(len(store.blobs), 7)
+            for round in range(2):
+                for index, actor in enumerate(actors):
+                    actor.send("inc", index)
+                    host.run_until_idle()
+                    self.assertLessEqual(self.resident(host), 3)
+            for actor in actors:
+                actor.send("report")
+            host.run_until_idle()
+            self.assertLessEqual(self.resident(host), 3)
+        return logs.labelled("n")
 
-        asyncio.run(main())
-        self.assertEqual(logs.labelled("n"), ["1 [5] report"])
+    def test_at_most_resident_actors_stay_in_memory(self):
+        for datamodel, n in (("python", "2 [%d, %d] report"), ("ecmascript", "2 [%d,%d] report")):
+            with self.subTest(datamodel=datamodel):
+                lines = self.population(datamodel, Store())
+                self.assertEqual(sorted(lines), sorted(n % (i, i) for i in range(10)))
+
+    def test_memory_store(self):
+        store = tinyactors.MemoryStore()
+        self.assertEqual(len(self.population("python", store)), 10)
+        store.save(1, b"x")
+        self.assertEqual(store.load(1), b"x")
+        store.delete(1)
+        store.delete(1)
+        with self.assertRaises(KeyError):
+            store.load(1)
+
+    def test_sqlite_store(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = tinyactors.SQLiteStore(os.path.join(directory, "actors.db"))
+            store.save(2 ** 64 - 1, b"last")
+            self.assertEqual(store.load(2 ** 64 - 1), b"last")
+            store.delete(2 ** 64 - 1)
+
+            class Counted:
+                def __init__(self, inner):
+                    self.inner = inner
+                    self.blobs = set()
+
+                def save(self, session, blob):
+                    self.blobs.add(session)
+                    self.inner.save(session, blob)
+
+                def load(self, session):
+                    return self.inner.load(session)
+
+                def delete(self, session):
+                    self.blobs.discard(session)
+                    self.inner.delete(session)
+            self.assertEqual(len(self.population("python", Counted(store))), 10)
+            store.close()
+
+    def test_an_actor_terminated_in_the_store_is_deleted_from_it(self):
+        store = Store()
+        with host_with([("counter.scxml", COUNTER["python"])], store=store) as host:
+            actor = host.spawn("counter")
+            host.run_until_idle()
+            store.save(actor.id, host.hibernate(actor))
+            actor.terminate()  # core wakes it to end it: the WAKE loads the blob, then deletes it
+            self.assertIn(actor.id, store.blobs)
+            host.run_until_idle()
+            self.assertEqual(store.blobs, {})
+
+    def test_a_save_that_raises_keeps_the_actor_resident(self):
+        class Full(Store):
+            def save(self, session, blob):
+                raise OSError("disk full")
+
+        logs, errors = Logs(), []
+        with host_with([("counter.scxml", COUNTER["python"])], log=logs, store=Full(), resident=1) as host:
+            actors = [host.spawn("counter") for _ in range(2)]
+            with self.assertRaises(OSError):  # without on_handler_error: raised after the turn
+                host.run_until_idle()
+        with host_with([("counter.scxml", COUNTER["python"])], log=logs, store=Full(), resident=1,
+                       on_handler_error=lambda error, effect: errors.append((type(error), effect))) as host:
+            actors = [host.spawn("counter") for _ in range(2)]
+            host.run_until_idle()
+            self.assertEqual(errors[0], (OSError, None))
+            self.assertEqual(self.resident(host), 2)
+            for actor in actors:
+                actor.send("report")
+            host.run_until_idle()
+        self.assertEqual(logs.labelled("n"), ["0 [] report", "0 [] report"])
+
+    def test_the_arguments_are_checked(self):
+        with self.assertRaises(TypeError):
+            host_with([("counter.scxml", COUNTER["python"])], resident=3)  # no store
+        with self.assertRaises(ValueError):
+            host_with([("counter.scxml", COUNTER["python"])], store=Store(), resident=0)
+        with self.assertRaises(TypeError):
+            host_with([("counter.scxml", COUNTER["python"])], store=object())
 
 
 if __name__ == "__main__":

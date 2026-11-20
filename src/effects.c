@@ -63,6 +63,25 @@ static PyObject *ta_python_effect_payload(ta_python_view *view) {
 }
 
 /* A send's field `which`, converted on first read and cached. */
+/* The (type, handler, async) row of a SEND's processor, numbered as
+ * _ioprocessors: 0 the SCXML processor, so the host's transport; i + 1 the
+ * config's processor i; NULL otherwise (TA_NIL: an invoked service). */
+static PyObject *ta_python_processor_row(ta_python_host *host, uint32_t processor) {
+    if (processor == 0) return host->transport;
+    return processor != TA_NIL && processor - 1 < (uint32_t)PyList_Size(host->processors)
+               ? PyList_GetItem(host->processors, processor - 1)
+               : NULL;
+}
+
+/* An address the effect gives as text, as an Address (None stays None):
+ * the transport's target, and every send's origin. */
+static PyObject *ta_python_address_of(ta_python_view *view, PyObject *text) {
+    if (!text || text == Py_None) return text;
+    PyObject *address = ta_python_address_from_text(view->host->state, text);
+    Py_DECREF(text);
+    return address;
+}
+
 static PyObject *ta_python_send_read(ta_python_view *view, int which) {
     if (view->fields[which]) return Py_NewRef(view->fields[which]);
     if (ta_python_view_live(view) < 0) return NULL;
@@ -73,18 +92,19 @@ static PyObject *ta_python_send_read(ta_python_view *view, int which) {
         break;
     case TA_PYTHON_SEND_SENDID: value = ta_python_effect_text(view, (ta_python_text_field){TA_EFFECT_FIELD_SENDID, 1}); break;
     case TA_PYTHON_SEND_EVENT: value = ta_python_effect_text(view, (ta_python_text_field){TA_EFFECT_FIELD_EVENT, 0}); break;
-    case TA_PYTHON_SEND_TARGET: value = ta_python_effect_text(view, (ta_python_text_field){TA_EFFECT_FIELD_TARGET, 1}); break;
+    case TA_PYTHON_SEND_TARGET: /* another system's address for the transport (0), else the processor's text */
+        value = ta_python_effect_text(view, (ta_python_text_field){TA_EFFECT_FIELD_TARGET, 1});
+        if (view->processor == 0) value = ta_python_address_of(view, value);
+        break;
     case TA_PYTHON_SEND_DATA: value = ta_python_effect_payload(view); break;
     case TA_PYTHON_SEND_TRACEPARENT: /* formatted by core on first ask; empty when untraced */
         value = ta_python_effect_text(view, (ta_python_text_field){TA_EFFECT_FIELD_TRACEPARENT, 1});
         break;
     case TA_PYTHON_SEND_ORIGIN: /* the sender's address, formatted by core on first ask */
-        value = ta_python_effect_text(view, (ta_python_text_field){TA_EFFECT_FIELD_ORIGIN, 1});
+        value = ta_python_address_of(view, ta_python_effect_text(view, (ta_python_text_field){TA_EFFECT_FIELD_ORIGIN, 1}));
         break;
-    default: { /* the I/O processor's type; None for a send to an invoked service */
-        PyObject *row = view->processor < (uint32_t)PyList_Size(view->host->processors)
-                            ? PyList_GetItem(view->host->processors, view->processor)
-                            : NULL;
+    default: { /* the I/O processor's type; None for the transport or an invoked service */
+        PyObject *row = ta_python_processor_row(view->host, view->processor);
         value = Py_NewRef(row ? PyTuple_GetItem(row, 0) : Py_None);
     }
     }
@@ -165,7 +185,39 @@ TA_PYTHON_GETTER(send, target, TA_PYTHON_SEND_TARGET)
 TA_PYTHON_GETTER(send, data, TA_PYTHON_SEND_DATA)
 TA_PYTHON_GETTER(send, traceparent, TA_PYTHON_SEND_TRACEPARENT)
 TA_PYTHON_GETTER(send, type, TA_PYTHON_SEND_TYPE)
+
+/* send.message: the outgoing half of a send between systems, the value
+ * Host.send takes on the other side (the fields of ta_event_in). */
+static PyObject *ta_python_send_message(PyObject *self, void *closure) {
+    (void)closure;
+    static const char *const keys[] = {"target", "event", "data", "sendid", "origin", "traceparent"};
+    static const int fields[] = {TA_PYTHON_SEND_TARGET, TA_PYTHON_SEND_EVENT,  TA_PYTHON_SEND_DATA,
+                                 TA_PYTHON_SEND_SENDID, TA_PYTHON_SEND_ORIGIN, TA_PYTHON_SEND_TRACEPARENT};
+    PyObject *message = PyDict_New();
+    for (int i = 0; message && i < 6; i++) {
+        PyObject *value = ta_python_send_read((ta_python_view *)self, fields[i]);
+        if (!value || PyDict_SetItemString(message, keys[i], value) < 0) Py_CLEAR(message);
+        Py_XDECREF(value);
+    }
+    return message;
+}
 TA_PYTHON_GETTER(send, origin, TA_PYTHON_SEND_ORIGIN)
+
+/* view.host: the Host the effect came from, on every view and record. */
+static PyObject *ta_python_view_host(PyObject *self, void *closure) {
+    (void)closure;
+    return Py_NewRef((PyObject *)((ta_python_view *)self)->host);
+}
+
+/* send.sender: the sending actor, an Actor of its session. */
+static PyObject *ta_python_send_sender(PyObject *self, void *closure) {
+    (void)closure;
+    ta_python_view *view = (ta_python_view *)self;
+    PyObject *session = ta_python_send_read(view, TA_PYTHON_SEND_SESSION);
+    PyObject *actor = session ? PyObject_CallFunctionObjArgs(view->host->state->actor_type, (PyObject *)view->host, session, NULL) : NULL;
+    Py_XDECREF(session);
+    return actor;
+}
 TA_PYTHON_GETTER(entry, session, TA_PYTHON_ENTRY_SESSION)
 TA_PYTHON_GETTER(entry, label, TA_PYTHON_ENTRY_LABEL)
 TA_PYTHON_GETTER(entry, text, TA_PYTHON_ENTRY_TEXT)
@@ -183,6 +235,8 @@ typedef struct ta_python_answer {
     PyObject *origin, *raw; /* where to reply, the transport's message: NULL for none */
 } ta_python_answer;
 
+/* 1: delivered; 0: the sender ended, so nobody is told (as XState drops an
+ * event to a stopped actor); -1: refused, an exception set. */
 static int ta_python_send_answer_with(ta_python_view *view, const ta_python_answer *answer) {
     if (ta_python_view_live(view) < 0) return -1; /* a thin view answers before its ack, whatever was read */
     if (view->answered) {
@@ -201,6 +255,14 @@ static int ta_python_send_answer_with(ta_python_view *view, const ta_python_answ
         memset(&event, 0, sizeof event);
         event.size = sizeof event;
         event.session = PyLong_AsUnsignedLongLong(session);
+        ta_host_location location;
+        if (ta_host_locate(host->host, event.session, &location) != TA_OK) { /* the sender ended: nobody to tell */
+            ta_python_leave(&call);
+            Py_DECREF(session);
+            Py_DECREF(sendid);
+            Py_DECREF(type);
+            return 0;
+        }
         ta_python_payload_for payload = {event.session, {0, 0}, answer->data, 0, TA_NIL};
         if (ta_python_text(sendid, &event.sendid) < 0 || ta_python_text(answer->traceparent, &event.traceparent) < 0)
             status = -1;
@@ -212,13 +274,17 @@ static int ta_python_send_answer_with(ta_python_view *view, const ta_python_answ
         if (status == 0) {
             event.data = payload.payload;
             ta_status sent = ta_host_send(host->host, &event);
-            if (sent != TA_OK) {
+            if (sent == TA_ERROR_STALE) { /* the sender ended: nobody to tell */
+                ta_python_host_payload_release(host, payload.payload, payload.datamodel);
+                status = 0;
+            } else if (sent != TA_OK) {
                 ta_python_host_payload_release(host, payload.payload, payload.datamodel);
                 ta_python_raise_status(host->state, sent);
                 status = -1;
             } else {
                 view->answered = 1;
                 ta_python_loop_schedule(host);
+                status = 1;
             }
         }
         ta_python_leave(&call);
@@ -242,7 +308,7 @@ static PyObject *ta_python_send_answer(PyObject *self, PyObject *arguments, PyOb
     int status = ta_python_send_answer_with(view, &answer);
     Py_DECREF(kept);
     if (status < 0) return NULL;
-    Py_RETURN_NONE;
+    return PyBool_FromLong(status);
 }
 
 static PyObject *ta_python_send_fail(PyObject *self, PyObject *unused) {
@@ -254,7 +320,7 @@ static PyObject *ta_python_send_fail(PyObject *self, PyObject *unused) {
     int status = ta_python_send_answer_with(view, &answer);
     Py_DECREF(traceparent);
     if (status < 0) return NULL;
-    Py_RETURN_NONE;
+    return PyBool_FromLong(status);
 }
 
 /* A handler raised before answering: fail the send for it (ADR 0009: a
@@ -284,6 +350,9 @@ static PyGetSetDef ta_python_send_properties[] = {
     {"traceparent", ta_python_send_traceparent, NULL, ta_python_doc_send_traceparent, NULL},
     {"type", ta_python_send_type, NULL, ta_python_doc_send_type, NULL},
     {"origin", ta_python_send_origin, NULL, ta_python_doc_send_origin, NULL},
+    {"message", ta_python_send_message, NULL, ta_python_doc_send_message, NULL},
+    {"sender", ta_python_send_sender, NULL, ta_python_doc_send_sender, NULL},
+    {"host", ta_python_view_host, NULL, ta_python_doc_view_host, NULL},
     {NULL, NULL, NULL, NULL, NULL}
 };
 
@@ -310,6 +379,7 @@ static PyGetSetDef ta_python_entry_properties[] = {
     {"session", ta_python_entry_session, NULL, ta_python_doc_entry_session, NULL},
     {"label", ta_python_entry_label, NULL, ta_python_doc_entry_label, NULL},
     {"text", ta_python_entry_text, NULL, ta_python_doc_entry_text, NULL},
+    {"host", ta_python_view_host, NULL, ta_python_doc_view_host, NULL},
     {NULL, NULL, NULL, NULL, NULL}
 };
 
@@ -328,6 +398,7 @@ static PyGetSetDef ta_python_migrated_properties[] = {
     {"segment", ta_python_migrated_segment, NULL, ta_python_doc_migrated_segment, NULL},
     {"chart", ta_python_migrated_chart, NULL, ta_python_doc_migrated_chart, NULL},
     {"migration", ta_python_migrated_migration, NULL, ta_python_doc_migrated_migration, NULL},
+    {"host", ta_python_view_host, NULL, ta_python_doc_view_host, NULL},
     {NULL, NULL, NULL, NULL, NULL}
 };
 
@@ -364,7 +435,8 @@ PyObject *ta_python_send_task_done(PyObject *send, PyObject *task) {
             Py_XDECREF(done);
             PyErr_Clear();
         }
-        if (!view->host->error) view->host->error = Py_NewRef(exception);
+        PyErr_SetRaisedException(Py_NewRef(exception));
+        ta_python_handler_failed(view->host, send);
         ta_python_loop_schedule(view->host); /* the turn hands it to idle() */
     }
     Py_XDECREF(exception);
@@ -377,7 +449,7 @@ static PyObject *ta_python_telemetry_done(PyObject *host, PyObject *task);
 static PyMethodDef ta_python_telemetry_done_def = {"done", ta_python_telemetry_done, METH_O,
                                                    "An async telemetry handler's task ended."};
 
-/* An async handler's task ended (telemetry, wake): its exception is kept
+/* An async handler's task ended (telemetry): its exception is kept
  * for the driver, as a plain handler's is. */
 static PyObject *ta_python_telemetry_done(PyObject *self, PyObject *task) {
     ta_python_host *host = (ta_python_host *)self;
@@ -386,7 +458,8 @@ static PyObject *ta_python_telemetry_done(PyObject *self, PyObject *task) {
     Py_XDECREF(cancelled);
     PyObject *exception = was_cancelled ? NULL : PyObject_CallMethod(task, "exception", NULL);
     if (exception && exception != Py_None && host->host) {
-        if (!host->error) host->error = Py_NewRef(exception);
+        PyErr_SetRaisedException(Py_NewRef(exception));
+        ta_python_handler_failed(host, NULL);
         ta_python_loop_schedule(host);
     }
     Py_XDECREF(exception);
@@ -410,25 +483,6 @@ PyObject *ta_python_host_task(ta_python_host *host, PyObject *coroutine) {
     return task;
 }
 
-/* A WAKE: an event or a due delayed send came for a hibernated session
- * (one effect per hibernation, however many come), or a migration
- * asks for it (MIGRATION: its id; None to Python otherwise). The application's handler
- * loads the session's blob and calls host.wake(session, blob), now or
- * later (an async def handler runs as a task); the events wait in its
- * mailbox. */
-static void ta_python_dispatch_wake(ta_python_host *host, uint32_t index) {
-    if (host->wake == Py_None) return;
-    PyObject *session = PyLong_FromUnsignedLongLong(ta_host_effect_number(host->host, index, TA_EFFECT_FIELD_SESSION));
-    uint64_t id = ta_host_effect_number(host->host, index, TA_EFFECT_FIELD_MIGRATION); /* 0: no migration asked */
-    PyObject *migration = !session ? NULL : id ? PyLong_FromUnsignedLongLong(id) : Py_NewRef(Py_None);
-    PyObject *result = migration ? PyObject_CallFunctionObjArgs(host->wake, (PyObject *)host, session, migration, NULL) : NULL;
-    if (result && host->wake_async) result = ta_python_host_task(host, result);
-    if (!result) ta_python_host_keep_error(host);
-    Py_XDECREF(result);
-    Py_XDECREF(migration);
-    Py_XDECREF(session);
-}
-
 /* The application's exporter gets the request as bytes it keeps (one copy,
  * boundary.md section 7); posting it, retrying and capping what waits are
  * the application's. Without a handler the request is dropped. */
@@ -436,13 +490,13 @@ void ta_python_telemetry(ta_python_host *host, const ta_python_export *export) {
     if (!host->telemetry || host->telemetry == Py_None) return;
     PyObject *signal = PyUnicode_InternFromString(export->signal);
     PyObject *data = signal ? PyBytes_FromStringAndSize(export->data.pointer, (Py_ssize_t)export->data.length) : NULL;
-    PyObject *result = data ? PyObject_CallFunctionObjArgs(host->telemetry, (PyObject *)host, signal, data, NULL) : NULL;
+    PyObject *result = data ? PyObject_CallFunctionObjArgs(host->telemetry, signal, data, NULL) : NULL;
     if (result && host->telemetry_async) { /* a coroutine: a task on the host's loop */
         PyObject *task = ta_python_host_task(host, result);
         if (task && host->ending && host->ending_tasks) PyList_Append(host->ending_tasks, task); /* __aexit__ awaits */
         result = task;
     }
-    if (!result) ta_python_host_keep_error(host);
+    if (!result) ta_python_handler_failed(host, NULL);
     Py_XDECREF(result);
     Py_XDECREF(data);
     Py_XDECREF(signal);
@@ -464,13 +518,48 @@ void ta_python_take(ta_python_host *host, int traces) {
 
 static void ta_python_dispatch_service_send(ta_python_host *host, uint32_t index);
 
+int ta_python_ask_reply(ta_python_host *host, uint32_t index) {
+    static const char prefix[] = TA_PYTHON_ASK_PREFIX;
+    ta_string_view target = ta_host_effect_text(host->host, index, TA_EFFECT_FIELD_TARGET);
+    if (target.length <= sizeof prefix - 1 || memcmp(target.pointer, prefix, sizeof prefix - 1) != 0) return 0;
+    uint64_t handle = 0;
+    for (size_t i = sizeof prefix - 1; i < target.length; i++) {
+        char digit = target.pointer[i];
+        if (digit < '0' || digit > '9' || handle > (UINT64_MAX - 9) / 10) return 1; /* no ask of ours: dropped */
+        handle = handle * 10 + (uint64_t)(digit - '0');
+    }
+    ta_python_ask_row *row = ta_table_get(&host->asks, handle);
+    if (!row) return 1; /* stale: answered, cancelled, or never ours */
+    PyObject *future = row->future;
+    ta_table_remove(&host->asks, handle);
+    ta_python_view *view = ta_python_view_new(host, host->state->send_type, index);
+    PyObject *event = view ? ta_python_send_read(view, TA_PYTHON_SEND_EVENT) : NULL;
+    PyObject *data = event ? ta_python_send_read(view, TA_PYTHON_SEND_DATA) : NULL;
+    PyObject *reply = data ? PyTuple_Pack(2, event, data) : NULL;
+    PyObject *settled = reply ? PyObject_CallMethod(future, "done", NULL) : NULL;
+    PyObject *method = settled && !PyObject_IsTrue(settled) ? PyUnicode_FromString("set_result") : NULL;
+    PyObject *set = method ? PyObject_CallMethodObjArgs(future, method, reply, NULL) /* the pair is one argument */
+                           : Py_NewRef(Py_None);
+    Py_XDECREF(method);
+    if (!set) ta_python_host_keep_error(host);
+    Py_XDECREF(set);
+    Py_XDECREF(settled);
+    Py_XDECREF(reply);
+    Py_XDECREF(data);
+    Py_XDECREF(event);
+    Py_XDECREF((PyObject *)view);
+    Py_DECREF(future);
+    return 1;
+}
+
 static void ta_python_dispatch_send(ta_python_host *host, uint32_t index) {
     uint32_t processor = (uint32_t)ta_host_effect_number(host->host, index, TA_EFFECT_FIELD_IO_PROCESSOR);
+    if (processor == 0 && ta_python_ask_reply(host, index)) return; /* an ask's reply, not the transport's */
     if (processor == TA_NIL) { /* a send to an invoked service: by (segment, token) */
         ta_python_dispatch_service_send(host, index);
         return;
     }
-    PyObject *row = processor < (uint32_t)PyList_Size(host->processors) ? PyList_GetItem(host->processors, processor) : NULL;
+    PyObject *row = ta_python_processor_row(host, processor); /* the transport's too: 0 */
     if (!row) return;
     ta_python_view *view = ta_python_view_new(host, host->state->send_type, index);
     if (!view) {
@@ -491,23 +580,23 @@ static void ta_python_dispatch_send(ta_python_host *host, uint32_t index) {
             Py_XDECREF(value);
         }
         view->record = 1;
-        PyObject *coroutine = status == 0 ? PyObject_CallFunctionObjArgs(handler, (PyObject *)host, (PyObject *)view, NULL) : NULL;
+        PyObject *coroutine = status == 0 ? PyObject_CallFunctionObjArgs(handler, (PyObject *)view, NULL) : NULL;
         PyObject *task = coroutine ? PyObject_CallMethod(host->loop, "create_task", "O", coroutine) : NULL;
         PyObject *done = task ? PyCFunction_New(&ta_python_task_done_def, (PyObject *)view) : NULL;
         PyObject *added = done ? PyObject_CallMethod(task, "add_done_callback", "O", done) : NULL;
         if (!added) {
             ta_python_send_failed(view);
-            ta_python_host_keep_error(host);
+            ta_python_handler_failed(host, (PyObject *)view);
         }
         Py_XDECREF(coroutine);
         Py_XDECREF(task);
         Py_XDECREF(done);
         Py_XDECREF(added);
     } else {
-        PyObject *result = PyObject_CallFunctionObjArgs(handler, (PyObject *)host, (PyObject *)view, NULL);
+        PyObject *result = PyObject_CallFunctionObjArgs(handler, (PyObject *)view, NULL);
         if (!result) {
             ta_python_send_failed(view);
-            ta_python_host_keep_error(host);
+            ta_python_handler_failed(host, (PyObject *)view);
         }
         Py_XDECREF(result);
     }
@@ -523,8 +612,11 @@ typedef struct ta_python_handler {
 static void ta_python_dispatch_view(ta_python_host *host, ta_python_handler handler, uint32_t index) {
     if (handler.handler == Py_None) return;
     ta_python_view *view = ta_python_view_new(host, handler.type, index);
-    PyObject *result = view ? PyObject_CallFunctionObjArgs(handler.handler, (PyObject *)host, (PyObject *)view, NULL) : NULL;
-    if (!result) ta_python_host_keep_error(host);
+    PyObject *result = view ? PyObject_CallFunctionObjArgs(handler.handler, (PyObject *)view, NULL) : NULL;
+    if (!result) {
+        if (view) ta_python_handler_failed(host, (PyObject *)view);
+        else ta_python_host_keep_error(host);
+    }
     Py_XDECREF(result);
     Py_XDECREF((PyObject *)view);
 }
@@ -640,6 +732,11 @@ static PyObject *ta_python_invocation_field(PyObject *self, void *closure) {
     return Py_NewRef(*(PyObject **)((char *)self + (size_t)closure));
 }
 
+static PyObject *ta_python_invocation_host(PyObject *self, void *closure) {
+    (void)closure;
+    return Py_NewRef((PyObject *)((ta_python_invocation *)self)->host);
+}
+
 static PyObject *ta_python_invocation_restored(PyObject *self, void *closure) {
     (void)closure;
     return PyBool_FromLong(((ta_python_invocation *)self)->restored);
@@ -688,6 +785,7 @@ static PyGetSetDef ta_python_invocation_properties[] = {
     {"traceparent", ta_python_invocation_field, NULL, ta_python_doc_invocation_traceparent, (void *)offsetof(ta_python_invocation, traceparent)},
     {"running", ta_python_invocation_running, NULL, ta_python_doc_invocation_running, NULL},
     {"restored", ta_python_invocation_restored, NULL, ta_python_doc_invocation_restored, NULL},
+    {"host", ta_python_invocation_host, NULL, ta_python_doc_view_host, NULL},
     {NULL, NULL, NULL, NULL, NULL}
 };
 
@@ -778,10 +876,9 @@ static void ta_python_dispatch_invoke(ta_python_host *host, uint32_t index) {
     PyObject_GC_Track((PyObject *)invocation);
     PyObject *handler = NULL, *service = NULL, *key = NULL, *entry = NULL;
     int found = invocation->data ? PyDict_GetItemRef(host->services, invocation->type, &handler) : -1;
-    /* none for a restored invocation: the application chose not to start it again, and the invoker hears so */
-    if (found == 0 && !invocation->restored)
-        PyErr_Format(host->state->error, "no service is registered for the invoke type %R", invocation->type);
-    if (found > 0) service = PyObject_CallFunctionObjArgs(handler, (PyObject *)host, (PyObject *)invocation, NULL);
+    /* none: the invoker hears so, and nothing is raised (a chart picks the type, and an
+     * untrusted one must not end the application's run) */
+    if (found > 0) service = PyObject_CallFunctionObjArgs(handler, (PyObject *)invocation, NULL);
     if (service && invocation->ended) goto done; /* the handler called done(): nothing to keep */
     if (!service) { /* it does not run: kept as failed, so sends to it fail too, until the UNINVOKE */
         PyObject *raised = PyErr_GetRaisedException();
@@ -792,7 +889,7 @@ static void ta_python_dispatch_invoke(ta_python_host *host, uint32_t index) {
             if (ta_python_invocation_post(invocation, &failed) < 0) PyErr_Clear();
         }
         PyErr_SetRaisedException(raised);
-        if (raised) ta_python_host_keep_error(host);
+        if (raised) ta_python_handler_failed(host, (PyObject *)invocation);
     }
     key = ta_python_invocation_key(invocation->segment, invocation->token);
     entry = key ? PyTuple_Pack(2, (PyObject *)invocation, service) : NULL;
@@ -862,10 +959,10 @@ static void ta_python_dispatch_service_send(ta_python_host *host, uint32_t index
     PyObject *result = NULL;
     if (view) {
         view->processor = TA_NIL;
-        result = PyObject_CallFunctionObjArgs(receive, (PyObject *)host, (PyObject *)view, NULL);
+        result = PyObject_CallFunctionObjArgs(receive, (PyObject *)view, NULL);
     }
     if (!result && view) ta_python_invocation_crashed(host, index);
-    if (!result) ta_python_host_keep_error(host);
+    if (!result) ta_python_handler_failed(host, (PyObject *)view);
     Py_XDECREF(result);
     Py_XDECREF((PyObject *)view);
     Py_DECREF(receive);
@@ -881,21 +978,44 @@ static void ta_python_dispatch_uninvoke(ta_python_host *host, uint32_t index) {
     int failed = (int)invocation->failed;
     ta_python_invocation_end(invocation);
     PyObject *stop = !failed && PyObject_HasAttrString(service, "stop") ? PyObject_GetAttrString(service, "stop") : NULL;
-    PyObject *result = stop ? PyObject_CallFunctionObjArgs(stop, (PyObject *)host, NULL) : Py_NewRef(Py_None);
-    if (!result) ta_python_host_keep_error(host);
+    PyObject *result = stop ? PyObject_CallNoArgs(stop) : Py_NewRef(Py_None);
+    if (!result) ta_python_handler_failed(host, (PyObject *)invocation);
     Py_XDECREF(result);
     Py_XDECREF(stop);
     Py_DECREF(entry);
 }
 
+/* The sessions a migration could not move, each {"session", "reason"}
+ * (the status that refused it, named by core), read now
+ * (ta_host_migration_failed: valid until the next run) into a bytes the
+ * list is made from, then dropped. */
+static PyObject *ta_python_migration_failed(ta_host *core, uint32_t index) {
+    uint32_t id = (uint32_t)ta_host_effect_number(core, index, TA_EFFECT_FIELD_MIGRATION);
+    uint32_t count = (uint32_t)ta_host_effect_number(core, index, TA_EFFECT_FIELD_FAILED);
+    PyObject *room = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)count * (Py_ssize_t)sizeof(ta_host_migration_failure));
+    ta_host_migration_failure *failures = room ? (ta_host_migration_failure *)PyBytes_AsString(room) : NULL;
+    uint32_t got = failures ? ta_host_migration_failed(core, id, (ta_host_migration_failures){failures, count}) : 0;
+    PyObject *failed = failures ? PyList_New(got < count ? got : count) : NULL;
+    for (uint32_t i = 0; failed && i < got && i < count; i++) {
+        PyObject *entry = Py_BuildValue("{s:K,s:s}", "session", (unsigned long long)failures[i].session, "reason",
+                                        ta_status_name((ta_status)failures[i].status));
+        if (!entry) Py_CLEAR(failed);
+        else PyList_SetItem(failed, i, entry);
+    }
+    Py_XDECREF(room);
+    return failed;
+}
+
 /* A migration ended: the host's migration_done handler gets {"migration",
- * "migrated", "failed", "pending"}, the sessions it left behind read now (ta_host_migration_pending:
- * valid until the next run) into a bytes the list is made from, then
- * dropped; no handler, nothing read. */
+ * "migrated", "failed", "pending"}, the sessions it could not move and
+ * those it left behind read now (ta_host_migration_failed,
+ * ta_host_migration_pending: valid until the next run) into bytes the
+ * lists are made from, then dropped; no handler, nothing read. */
 static void ta_python_dispatch_migration(ta_python_host *host, uint32_t index) {
     ta_host *core = host->host;
     uint32_t id = (uint32_t)ta_host_effect_number(core, index, TA_EFFECT_FIELD_MIGRATION);
-    PyObject *handler = host->migration_done, *migration = NULL, *pending = NULL, *result = NULL, *called = NULL;
+    PyObject *handler = host->migration_done, *migration = NULL, *pending = NULL, *failed = NULL, *result = NULL,
+             *called = NULL;
     int found = handler == Py_None ? 0 : (migration = PyLong_FromUnsignedLong(id)) ? 1 : -1;
     if (found > 0) {
         uint32_t count = (uint32_t)ta_host_effect_number(core, index, TA_EFFECT_FIELD_PENDING);
@@ -909,17 +1029,74 @@ static void ta_python_dispatch_migration(ta_python_host *host, uint32_t index) {
             else PyList_SetItem(pending, i, session);
         }
         Py_XDECREF(room);
-        result = pending ? Py_BuildValue("{s:O,s:k,s:k,s:O}", "migration", migration, "migrated",
-                                         (unsigned long)ta_host_effect_number(core, index, TA_EFFECT_FIELD_MIGRATED), "failed",
-                                         (unsigned long)ta_host_effect_number(core, index, TA_EFFECT_FIELD_FAILED), "pending", pending)
-                         : NULL;
-        called = result ? PyObject_CallFunctionObjArgs(handler, (PyObject *)host, result, NULL) : NULL;
+        failed = pending ? ta_python_migration_failed(core, index) : NULL;
+        result = failed ? Py_BuildValue("{s:O,s:k,s:O,s:O}", "migration", migration, "migrated",
+                                        (unsigned long)ta_host_effect_number(core, index, TA_EFFECT_FIELD_MIGRATED), "failed",
+                                        failed, "pending", pending)
+                        : NULL;
+        called = result ? PyObject_CallFunctionObjArgs(handler, result, NULL) : NULL;
     }
-    if (found < 0 || (found > 0 && !called)) ta_python_host_keep_error(host);
+    if (found < 0 || (found > 0 && !result)) ta_python_host_keep_error(host);
+    else if (found > 0 && !called) ta_python_handler_failed(host, NULL);
     Py_XDECREF(called);
     Py_XDECREF(result);
+    Py_XDECREF(failed);
     Py_XDECREF(pending);
     Py_XDECREF(migration);
+}
+
+/* TA_EFFECT_DONE (its donedata) or TA_EFFECT_ERROR (a fault, FLAGS its
+ * code): a top-level actor ended. The future of its Actor.done, if someone
+ * awaits it, is settled, then on_done(actor, donedata) or on_error(actor,
+ * error) is called; neither, nothing is read. */
+static void ta_python_dispatch_end(ta_python_host *host, uint32_t index) {
+    ta_host *core = host->host;
+    int done = ta_host_effect_number(core, index, TA_EFFECT_FIELD_KIND) == TA_EFFECT_DONE;
+    uint64_t session = ta_host_effect_number(core, index, TA_EFFECT_FIELD_SESSION);
+    PyObject *handler = done ? host->on_done : host->on_error, *future = NULL;
+    PyObject *key = PyLong_FromUnsignedLongLong(session);
+    if (key && PyDict_Size(host->done) && PyDict_GetItemRef(host->done, key, &future) > 0 && PyDict_DelItem(host->done, key) < 0)
+        PyErr_Clear();
+    Py_XDECREF(key);
+    if (handler == Py_None && !future) return;
+    PyObject *value = NULL;
+    if (done) {
+        ta_python_payload_of payload = {ta_host_effect_number(core, index, TA_EFFECT_FIELD_PAYLOAD),
+                                        (uint32_t)ta_host_effect_number(core, index, TA_EFFECT_FIELD_DATAMODEL)};
+        value = ta_python_host_payload_value(host, &payload);
+    } else {
+        PyObject *arguments = PyUnicode_FromFormat("actor %llu faulted (fault %u) and ended", (unsigned long long)session,
+                                                   (unsigned)ta_host_effect_number(core, index, TA_EFFECT_FIELD_FLAGS));
+        PyObject *message = arguments ? PyTuple_Pack(1, arguments) : NULL;
+        PyObject *keywords = message ? Py_BuildValue("{s:s}", "status", "TA_ERROR_FATAL") : NULL;
+        value = keywords ? PyObject_Call(host->state->error, message, keywords) : NULL;
+        Py_XDECREF(keywords);
+        Py_XDECREF(message);
+        Py_XDECREF(arguments);
+    }
+    if (!value) {
+        ta_python_host_keep_error(host);
+        Py_XDECREF(future);
+        return;
+    }
+    if (future) {
+        PyObject *settled = PyObject_CallMethod(future, "done", NULL);
+        PyObject *set = settled && !PyObject_IsTrue(settled)
+                            ? PyObject_CallMethod(future, done ? "set_result" : "set_exception", "O", value)
+                            : Py_NewRef(Py_None);
+        if (!set) PyErr_Clear();
+        Py_XDECREF(set);
+        Py_XDECREF(settled);
+        Py_DECREF(future);
+    }
+    if (handler != Py_None) {
+        PyObject *actor = ta_python_actor_new(host, session);
+        PyObject *called = actor ? PyObject_CallFunctionObjArgs(handler, actor, value, NULL) : NULL;
+        if (!called) ta_python_handler_failed(host, NULL);
+        Py_XDECREF(called);
+        Py_XDECREF(actor);
+    }
+    Py_DECREF(value);
 }
 
 void ta_python_dispatch(ta_python_host *host, uint32_t index) {
@@ -935,19 +1112,27 @@ void ta_python_dispatch(ta_python_host *host, uint32_t index) {
         break;
     }
     case TA_HOST_EFFECT_REPLY: ta_python_reply(host, index); break;
-    case TA_EFFECT_WAKE: ta_python_dispatch_wake(host, index); break;
+    case TA_EFFECT_WAKE: /* an event, a due delayed send or a migration came for a hibernated session (one
+                            effect per hibernation): its blob from the store, woken */
+    {
+        uint64_t session = ta_host_effect_number(core, index, TA_EFFECT_FIELD_SESSION);
+        if (!(ta_host_effect_number(core, index, TA_EFFECT_FIELD_MIGRATION) && ta_python_host_defer(host, session))) ta_python_host_load(host, session);
+        break;
+    }
     case TA_HOST_EFFECT_MIGRATED:
         ta_python_dispatch_view(host, (ta_python_handler){host->migrated, host->state->migrated_type}, index);
         break;
     case TA_HOST_EFFECT_MIGRATION_DONE: ta_python_dispatch_migration(host, index); break;
     case TA_EFFECT_INVOKE: ta_python_dispatch_invoke(host, index); break;
+    case TA_EFFECT_DONE:
+    case TA_EFFECT_ERROR: ta_python_dispatch_end(host, index); break; /* the datamodel's rows went with destroy */
     case TA_EFFECT_UNINVOKE: ta_python_dispatch_uninvoke(host, index); break;
     case TA_HOST_EFFECT_TRACES: /* a request is ready: taken (the next comes only after a take) */
     case TA_HOST_EFFECT_LOGS: {
         ta_python_take(host, ta_host_effect_number(core, index, TA_EFFECT_FIELD_KIND) == TA_HOST_EFFECT_TRACES);
         break;
     }
-    default: /* DONE, ERROR: the datamodel's rows went with destroy; SEGMENT_FREED: the host keeps the
+    default: /* SEGMENT_FREED: the host keeps the
                 images, we keep none; a NOTIFICATION we do not know; the rest has no API yet */
         break;
     }

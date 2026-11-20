@@ -46,10 +46,14 @@ typedef struct ta_python_module_state {
     PyObject *builtins;       /* what a "python" chart's code may call */
     PyObject *attach;         /* support.attach: a chart's class and functions */
     PyObject *check_file;     /* support.check_file: a .py file a resolver read */
+    PyObject *settlers;       /* support.settlers: the handlers of a typed method given none */
     PyObject *event_kinds;    /* ("platform", "internal", "external") */
     PyObject *event_key;      /* "_event", interned: bind_event makes no key per event */
     PyObject *time_ns;        /* time.time_ns: the wall clock */
     PyObject *coroutine_function; /* inspect.iscoroutinefunction */
+    PyObject *actor_type;     /* support.Actor: an actor of a host, made where the API returns one */
+    PyObject *host_config;    /* support.host_config: Host(...)'s config and I/O processors */
+    PyObject *host_actors;    /* support.actors: host.actors() */
 } ta_python_module_state;
 
 /* The state of the module that defined `type` (a method's defining class,
@@ -82,6 +86,7 @@ void ta_python_cbor_init(ta_cbor_writer *writer, const ta_python_room *room);
 int ta_python_value_write(ta_python_module_state *state, ta_cbor_writer *writer, PyObject *value);
 /* One whole CBOR item as a Python value: a new reference or NULL. */
 PyObject *ta_python_value_read(ta_python_module_state *state, ta_bytes cbor);
+PyObject *ta_python_decode_traces(PyObject *module, PyObject *data);
 /* A copy of a value for another actor: mutable containers (list, dict)
  * copied, immutable values shared, anything outside the table refused
  * (TypeError) and nesting past 64 refused (ValueError). */
@@ -118,6 +123,9 @@ typedef struct ta_python_datamodel {
     PyObject *drops;            /* values whose last reference was dropped (a list) */
     PyObject *raised;           /* a BaseException an evaluation raised, raised after it */
     PyObject *output;           /* the str eval_string and log answered */
+    PyObject *failure;          /* "Type: message" of the exception the last entry failed with, NULL
+                                   when it did not; forgotten when the next entry starts */
+    uint32_t failure_reason;    /* its TA_DATAMODEL_FAILURE_* */
     PyObject *origintypes;      /* the session's I/O processors' types (system variables, the same for
                                    every session of the host), by an event's origintype_id; NULL until
                                    the first create */
@@ -161,7 +169,17 @@ enum { TA_PYTHON_DATAMODEL_PYTHON = 0, TA_PYTHON_DATAMODEL_ECMASCRIPT = 1, TA_PY
 typedef struct ta_python_pending_row {
     PyObject *handler;
     PyObject *on_error;
+    int timers; /* actor.get: its result's timers[].due are the host's ticks, given as seconds */
 } ta_python_pending_row;
+
+/* An ask: a row of the asks table, whose handle names the reply's address
+ * (tinyactors://tinyactors-ask/@<handle>). */
+typedef struct ta_python_ask_row {
+    PyObject *future;
+} ta_python_ask_row;
+
+/* The system id of ask's reply addresses, and their prefix. */
+#define TA_PYTHON_ASK_PREFIX "tinyactors://tinyactors-ask/@"
 
 struct ta_python_host {
     PyObject_HEAD
@@ -174,6 +192,7 @@ struct ta_python_host {
     ta_datamodel_ecmascript *ecmascript;
     ta_datamodel_binding datamodels[TA_PYTHON_DATAMODELS];
     ta_table pending;                  /* ta_python_pending_row */
+    ta_table asks;                     /* ta_python_ask_row: an ask waiting for its reply */
     uint64_t acks;                     /* batches acknowledged: a view's batch */
     uint64_t ticks_per_second;         /* host.config's system.ticksPerSecond */
     unsigned long thread;              /* the creating thread */
@@ -191,15 +210,22 @@ struct ta_python_host {
     int has_async;                     /* an async def I/O processor */
     int inputs;                        /* an input was made since the last run */
     PyObject *processors;              /* per ioProcessors index: (type, handler, async) */
+    PyObject *transport;               /* (None, handler or None, async): sends to other systems */
     PyObject *log;                     /* log handler or None */
-    PyObject *telemetry;               /* telemetry handler(host, signal, data) or None */
-    PyObject *wake;                    /* wake handler(host, session, migration) or None */
-    PyObject *migrated;                /* migrated handler(host, migration) or None */
-    PyObject *services;                /* dict: an invoke's type -> handler(host, invocation) */
+    PyObject *telemetry;               /* telemetry handler(signal, data) or None */
+    PyObject *migrated;                /* migrated handler(migrated) or None */
+    PyObject *services;                /* dict: an invoke's type -> handler(invocation) */
     PyObject *invocations;             /* dict: segment << 32 | token -> (invocation, service), while it runs
                                           (core's keys: no table of ours) */
-    PyObject *migration_done;          /* migration_done handler(host, result) or None: every migration's end */
-    int wake_async;                    /* it is an async def */
+    PyObject *migration_done;          /* migration_done handler(result) or None: every migration's end */
+    PyObject *on_done;                 /* on_done(actor, donedata) or None: a top-level actor's TA_EFFECT_DONE */
+    PyObject *on_error;                /* on_error(actor, error) or None: a top-level actor's TA_EFFECT_ERROR */
+    PyObject *on_handler_error;        /* on_handler_error(error, effect) or None: a handler raised */
+    PyObject *done;                    /* dict: session -> future of Actor.done, only for actors someone awaits */
+    PyObject *system_id;               /* the effective config's systemID (a str) */
+    PyObject *store;                   /* save(session, blob), load(session), delete(session), or None */
+    uint64_t resident;                 /* the most actors kept in memory after a turn; 0: no bound */
+    PyObject *asked;                   /* dict: sessions a migration asked for, loaded when there is room */
     int telemetry_async;               /* it is an async def */
     int encoder;                       /* the config has "telemetry": the host stamps spans */
     int ending;                        /* the last take at close is running */
@@ -251,6 +277,31 @@ PyObject *ta_python_host_payload_value(ta_python_host *host, const ta_python_pay
 int ta_python_text(PyObject *text, ta_string_view *out);
 /* Record the first exception of a turn (the one set now), clearing it. */
 void ta_python_host_keep_error(ta_python_host *host);
+/* A handler raised (the exception set now) while it handled `effect` (a
+ * view, a record, or NULL): the host's on_handler_error gets an Exception
+ * (its own exception is kept), else it is kept as ta_python_host_keep_error
+ * keeps it. Clears it. */
+void ta_python_handler_failed(ta_python_host *host, PyObject *effect);
+/* After a turn that went idle: with a store and a resident bound, the
+ * actors past it hibernated into the store (ta_host_sweep's cold ones,
+ * ta_host_hibernate, store.save). */
+void ta_python_host_evict(ta_python_host *host);
+/* A migration's WAKE when the resident bound is reached: the session kept
+ * for a later turn with room (1), or 0: load it now. */
+int ta_python_host_defer(ta_python_host *host, uint64_t session);
+/* A WAKE: the session's blob from the store (store.load), woken
+ * (ta_host_wake) and deleted from the store; without a store, nothing. */
+void ta_python_host_load(ta_python_host *host, uint64_t session);
+/* A SEND for the transport whose target is an ask's reply address: the
+ * ask's future settled with (event, data), or a stale one dropped; 1 when
+ * it was one, 0 when the transport gets it. */
+int ta_python_ask_reply(ta_python_host *host, uint32_t index);
+/* Drop every ask: their futures never complete. */
+void ta_python_asks_drop(ta_python_host *host);
+/* An Actor of `session` (support.Actor): a new reference or NULL. */
+PyObject *ta_python_actor_new(ta_python_host *host, uint64_t session);
+/* A session from an int or an Actor of the host: 0, or -1 with an exception. */
+int ta_python_session(ta_python_host *host, PyObject *value, uint64_t *out);
 /* Free the host (ta_host_free) and drop every Python reference it holds;
  * `quiet`: no trace.end and no handler runs (the collector's path). */
 void ta_python_host_close(ta_python_host *host, int quiet);
@@ -273,7 +324,6 @@ void ta_python_clock_resume(ta_python_host *host, ta_time time);
  * says (MemoryError naming the pool, TinyactorsError for a fault): 0 or -1. */
 int ta_python_turn_raise(ta_python_host *host, ta_python_next next);
 PyObject *ta_python_host_run_until_idle(PyObject *self, PyObject *unused);
-PyObject *ta_python_host_run_forever(PyObject *self, PyObject *unused);
 PyObject *ta_python_host_idle(PyObject *self, PyObject *unused);
 /* An input made outside a turn under asyncio: schedule one turn. */
 void ta_python_loop_schedule(ta_python_host *host);

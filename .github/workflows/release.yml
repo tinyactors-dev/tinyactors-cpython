@@ -1,0 +1,61 @@
+# The GitHub release of a component's version, in its release repository.
+#
+# The monorepo's release adds this file to the snapshot of every directory
+# that has no .github/workflows/release.yml of its own (Release.snapshot_tree
+# in mise/lib/release.rb), so it runs in tinyactors-dev/<directory>, never in
+# the monorepo. A cloud session's git proxy pushes branches but not tags, so
+# a release made in one pushes its files to the branch release-assets/v<version>
+# and then the snapshot to main; this makes the rest with the workflow's own
+# token: the tag v<version> on the snapshot and its GitHub release, with
+# RELEASE_NOTES.md and those files, checked against their SHA256SUMS; then it
+# deletes the branch. Without that branch the release was made where tags
+# can be pushed (Release.push_and_release!), and this does nothing. It writes
+# nothing of its own.
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Release the snapshot's version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title=$(head -n 1 RELEASE_NOTES.md | sed 's/^# //')
+          version=${title##* }
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::RELEASE_NOTES.md's title names no version: $title"; exit 1 ;;
+          esac
+          tag="v$version"
+          branch="release-assets/$tag"
+          if ! git fetch --quiet --no-tags origin "refs/heads/$branch"; then
+            echo "There is no branch $branch: $tag's release is made where tags can be pushed."
+            exit 0
+          fi
+          mkdir dist
+          git archive FETCH_HEAD | tar -x -C dist
+          (cd dist && sha256sum --check --strict SHA256SUMS)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # A release made by an earlier run gets the files it lacks; its
+            # notes and its files' bytes stay as they are.
+            have=$(gh release view "$tag" --json assets --jq '.assets[].name')
+            for file in dist/*; do
+              echo "$have" | grep -qx "$(basename "$file")" || gh release upload "$tag" "$file"
+            done
+          else
+            gh release create "$tag" --target "$GITHUB_SHA" --title "$title" --notes-file RELEASE_NOTES.md dist/*
+          fi
+          git push origin --delete "$branch"

@@ -29,17 +29,52 @@ class Scope(unittest.TestCase):
         """A <foreach>'s item and index and the names a <script> assigns
         outside its defs are the chart's variables, None until set (SCXML
         4.6), and hibernate with the rest."""
-        logs, blobs = Logs(), {}
-        with host_with([("c.scxml", fixture("test_datamodel/declared.python.scxml"))], log=logs,
-                       wake=lambda host, session, migration: host.wake(session, blobs.pop(session))) as host:
+        logs, store = Logs(), tinyactors.MemoryStore()
+        with host_with([("c.scxml", fixture("test_datamodel/declared.python.scxml"))], log=logs, store=store) as host:
             session = host.spawn(host.chart("c"))
             host.run_until_idle()
-            blobs[session] = host.hibernate(session)
+            store.save(session.id, host.hibernate(session))
             host.send(session, "report")
             host.run_until_idle()
         self.assertEqual(logs.labelled("before"), ["[None, None]"])
         self.assertEqual(logs.labelled("after"), ["[4, 20, 20, 1]"])
         self.assertEqual(logs.labelled("report"), ["[4, 20, 20, 1]"])
+
+    def test_a_script_in_a_transition_runs_again(self):
+        """A <script> in executable content runs at each execution, on both
+        datamodels: on quickjs its let, const and class are its own at each
+        run; on "python" what it assigns is the session's."""
+        scripts = {
+            "python": ("<script>k = n + 1\nn = min(k, LIMIT)</script>", "<script>LIMIT = 2</script>", "f'{n}'"),
+            "ecmascript": ("<script>let k = n + 1; const c = Math.min(k, LIMIT); class K {} n = c;</script>",
+                           "<script>const LIMIT = 2;</script>", "'' + n"),
+        }
+        for datamodel, (script, top, report) in scripts.items():
+            with self.subTest(datamodel=datamodel):
+                document = ("<scxml xmlns='http://www.w3.org/2005/07/scxml' datamodel='%s' name='c' initial='s'>"
+                            "<datamodel><data id='n' expr='0'/></datamodel>%s<state id='s'>"
+                            "<transition event='go'>%s<log label='n' expr=\"%s\"/></transition>"
+                            "<transition event='error.execution'><log label='error' expr=\"'error'\"/></transition>"
+                            "</state></scxml>") % (datamodel, top, script, report)
+                logs = run(document, ["go", "go", "go"])
+                self.assertEqual(logs.labelled("n"), ["1", "2", "2"])
+                self.assertEqual(logs.labelled("error"), [])
+
+    def test_error_execution_says_why(self):
+        """The data of an error.execution the chart's code raised:
+        {"reason": "exception", "message": "Type: text"}; none for a failure
+        the host decides (an unknown <send> type)."""
+        document = ("<scxml xmlns='http://www.w3.org/2005/07/scxml' datamodel='python' name='c' initial='s'>"
+                    "<datamodel><data id='x' expr='0'/></datamodel><state id='s'>"
+                    "<transition event='go'><script>x = 1 // 0</script></transition>"
+                    "<transition event='type'><send event='x' type='urn:nosuch'/></transition>"
+                    "<transition event='error.execution'><log label='why' expr=\"_event.data\"/></transition>"
+                    "</state></scxml>")
+        logs = run(document, ["go", "type"])
+        why = logs.labelled("why")
+        self.assertEqual(len(why), 2)
+        self.assertTrue(why[0].startswith("{'reason': 'exception', 'message': 'ZeroDivisionError: "), why[0])
+        self.assertEqual(why[1], "None")
 
     def test_a_system_variable_is_read_only(self):
         for location in ("_sessionid", "_event", "_name"):
@@ -97,14 +132,14 @@ class Events(unittest.TestCase):
     def test_captured_data_is_a_copy(self):
         got = []
 
-        def processor(host, send):
+        def processor(send):
             got.append(send.data)
 
         run(fixture("test_datamodel/captured-data.python.scxml"), processors={APP: processor})
         self.assertEqual(got, [{"v": [1, 2, 3]}])  # the session's later change is not seen
 
     def test_a_value_outside_the_table_does_not_cross(self):
-        logs = run(fixture("test_datamodel/outside-table.python.scxml"), processors={APP: lambda host, send: None})
+        logs = run(fixture("test_datamodel/outside-table.python.scxml"), processors={APP: lambda send: None})
         self.assertEqual(logs.labelled("e"), ["refused"])
 
 

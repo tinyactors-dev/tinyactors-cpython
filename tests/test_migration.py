@@ -24,11 +24,11 @@ class Migration(unittest.TestCase):
         v1, v2 = versions(datamodel)
         logs, moved, done = Logs(), [], []
 
-        def migrated(host, entry):
+        def migrated(entry):
             moved.append((entry.session, entry.segment, entry.chart, entry.migration))
 
-        with host_with([("counter.scxml", v1)], migration_done=lambda host, result: done.append(result), log=logs, migrated=migrated) as host:
-            session = host.spawn(host.chart("counter"))
+        with host_with([("counter.scxml", v1)], migration_done=lambda result: done.append(result), log=logs, migrated=migrated) as host:
+            session = host.spawn("counter").id
             host.send(session, "inc")
             host.send(session, "inc")
             host.run_until_idle()
@@ -38,7 +38,7 @@ class Migration(unittest.TestCase):
             host.send(session, "inc")
             host.send(session, "report")
             host.run_until_idle()
-        self.assertEqual(done, [{"migration": migration, "migrated": 1, "failed": 0, "pending": []}])
+        self.assertEqual(done, [{"migration": migration, "migrated": 1, "failed": [], "pending": []}])
         self.assertEqual(moved, [(session, segment, "counter", migration)])
         return logs.labelled("n")
 
@@ -54,7 +54,7 @@ class Migration(unittest.TestCase):
                 v1, v2 = versions(datamodel)
                 logs, clock = Logs(), tinyactors.SimulatedClock()
                 with host_with([("counter.scxml", v1)], log=logs, clock=clock) as host:
-                    session = host.spawn(host.chart("counter"))
+                    session = host.spawn("counter").id
                     host.send(session, "inc")
                     host.send(session, "wait")
                     host.run_until_idle()
@@ -64,51 +64,42 @@ class Migration(unittest.TestCase):
                     clock.increment(1)
                 self.assertEqual(logs.labelled("later"), ["1"])
 
-    def test_a_hibernated_actor_is_asked_for_with_its_migration(self):
+    def test_a_hibernated_actor_is_loaded_for_its_migration(self):
+        """migrate(wake=True) asks for a hibernated actor: the host loads it
+        from its store, and the migration moves it."""
         v1, v2 = versions("python")
-        logs, blobs, asked, done = Logs(), {}, [], []
+        logs, done = Logs(), []
 
-        def wake(host, session, migration):
-            asked.append((session, migration))
-            host.wake(session, blobs.pop(session))
+        class Store(tinyactors.MemoryStore):
+            loaded = []
 
-        with host_with([("counter.scxml", v1)], migration_done=lambda host, result: done.append(result), log=logs, wake=wake) as host:
-            session = host.spawn(host.chart("counter"))
+            def load(self, session):
+                self.loaded.append(session)
+                return super().load(session)
+
+        store = Store()
+        with host_with([("counter.scxml", v1)], migration_done=lambda result: done.append(result), log=logs,
+                       store=store) as host:
+            session = host.spawn("counter").id
             host.send(session, "inc")
             host.run_until_idle()
-            blobs[session] = host.hibernate(session)
+            store.save(session, host.hibernate(session))
             add(host, v2)
-            migration = host.migrate(wake=True)
+            host.migrate(wake=True)
             host.run_until_idle()
             host.send(session, "report")
             host.run_until_idle()
-        self.assertEqual(asked, [(session, migration)])
+        self.assertEqual(Store.loaded, [session])
         self.assertEqual(done[0]["migrated"], 1)
         self.assertEqual(logs.labelled("n"), ["1 2 ['n', 'other']"])
-
-    def test_an_events_wake_names_no_migration(self):
-        v1, _ = versions("python")
-        blobs, asked = {}, []
-
-        def wake(host, session, migration):
-            asked.append(migration)
-            host.wake(session, blobs.pop(session))
-
-        with host_with([("counter.scxml", v1)], wake=wake) as host:
-            session = host.spawn(host.chart("counter"))
-            host.run_until_idle()
-            blobs[session] = host.hibernate(session)
-            host.send(session, "inc")
-            host.run_until_idle()
-        self.assertEqual(asked, [None])
 
     def test_without_wake_or_timeout_a_hibernated_actor_holds_the_migration(self):
         """The migration asks for a sleeping actor never (no wake) and so never
         ends without a timeout: the README says so."""
         v1, v2 = versions("python")
         done, clock = [], tinyactors.SimulatedClock()
-        with host_with([("counter.scxml", v1)], migration_done=lambda host, result: done.append(result), clock=clock) as host:
-            asleep = host.spawn(host.chart("counter"))
+        with host_with([("counter.scxml", v1)], migration_done=lambda result: done.append(result), clock=clock) as host:
+            asleep = host.spawn("counter").id
             host.run_until_idle()
             host.hibernate(asleep)
             add(host, v2)
@@ -120,8 +111,8 @@ class Migration(unittest.TestCase):
     def test_without_wake_a_hibernated_actor_is_left_at_the_timeout(self):
         v1, v2 = versions("python")
         done, clock = [], tinyactors.SimulatedClock()
-        with host_with([("counter.scxml", v1)], migration_done=lambda host, result: done.append(result), clock=clock) as host:
-            asleep, awake = host.spawn(host.chart("counter")), host.spawn(host.chart("counter"))
+        with host_with([("counter.scxml", v1)], migration_done=lambda result: done.append(result), clock=clock) as host:
+            asleep, awake = host.spawn("counter").id, host.spawn("counter").id
             host.run_until_idle()
             host.hibernate(asleep)
             add(host, v2)
@@ -129,15 +120,15 @@ class Migration(unittest.TestCase):
             host.run_until_idle()
             self.assertEqual(done, [])
             clock.increment(0.5)
-        self.assertEqual(done, [{"migration": migration, "migrated": 1, "failed": 0, "pending": [asleep]}])
+        self.assertEqual(done, [{"migration": migration, "migrated": 1, "failed": [], "pending": [asleep]}])
         self.assertNotIn(awake, done[0]["pending"])
 
     def test_one_session_or_one_chart(self):
         v1, v2 = versions("python")
         other = fixture("test_migration/other.python.scxml")
         done = []
-        with host_with([("counter.scxml", v1), ("other.scxml", other)], migration_done=lambda host, result: done.append(result)) as host:
-            a, b = host.spawn(host.chart("counter")), host.spawn(host.chart("counter"))
+        with host_with([("counter.scxml", v1), ("other.scxml", other)], migration_done=lambda result: done.append(result)) as host:
+            a, b = host.spawn("counter").id, host.spawn("counter").id
             host.run_until_idle()
             add(host, v2)
             host.migrate(session=a)
@@ -152,8 +143,8 @@ class Migration(unittest.TestCase):
     def test_a_python_actor_with_a_value_outside_the_table_stays(self):
         v1, v2 = versions("python")
         done = []
-        with host_with([("counter.scxml", v1)], migration_done=lambda host, result: done.append(result)) as host:
-            session = host.spawn(host.chart("counter"))
+        with host_with([("counter.scxml", v1)], migration_done=lambda result: done.append(result)) as host:
+            session = host.spawn("counter").id
             host.send(session, "odd")
             host.run_until_idle()
             add(host, v2)
@@ -162,13 +153,13 @@ class Migration(unittest.TestCase):
             host.send(session, "inc")  # still version 1, still running
             host.run_until_idle()
         self.assertEqual(done[0]["migrated"], 0)
-        self.assertEqual(done[0]["failed"], 1)
+        self.assertEqual(done[0]["failed"], [{"session": session, "reason": "TA_ERROR_UNSUPPORTED"}])
 
     def test_the_view_is_stale_after_the_ack(self):
         v1, v2 = versions("python")
         kept = []
-        with host_with([("counter.scxml", v1)], migrated=lambda host, entry: kept.append(entry)) as host:
-            host.spawn(host.chart("counter"))
+        with host_with([("counter.scxml", v1)], migrated=lambda entry: kept.append(entry)) as host:
+            host.spawn("counter").id
             host.run_until_idle()
             add(host, v2)
             host.migrate()
@@ -180,11 +171,11 @@ class Migration(unittest.TestCase):
     def test_a_handler_that_raises_is_raised_by_the_driver(self):
         v1, v2 = versions("python")
 
-        def done(host, result):
+        def done(result):
             raise ValueError("migration_done handler")
 
         with host_with([("counter.scxml", v1)], migration_done=done) as host:
-            host.spawn(host.chart("counter"))
+            host.spawn("counter").id
             host.run_until_idle()
             add(host, v2)
             host.migrate()
@@ -194,8 +185,8 @@ class Migration(unittest.TestCase):
     def test_a_migration_unfinished_at_close_never_reaches_its_handler(self):
         v1, v2 = versions("python")
         done = []
-        with host_with([("counter.scxml", v1)], migration_done=lambda host, result: done.append(result)) as host:
-            asleep = host.spawn(host.chart("counter"))
+        with host_with([("counter.scxml", v1)], migration_done=lambda result: done.append(result)) as host:
+            asleep = host.spawn("counter").id
             host.run_until_idle()
             host.hibernate(asleep)
             add(host, v2)
@@ -219,6 +210,24 @@ class Migration(unittest.TestCase):
                 host.migrate(timeout=float("inf"))
             with self.assertRaises(TypeError):
                 host.migrate(3)
+
+    def test_migrate_refuses_what_it_could_not_move(self):
+        """A chart the host does not have and a session that ended are
+        refused, not a migration that ends with nothing moved."""
+        done = []
+        with host_with([("counter.scxml", versions("python")[0])], migration_done=lambda result: done.append(result)) as host:
+            with self.assertRaises(tinyactors.TinyactorsError) as refused:
+                host.migrate(chart="counters")
+            self.assertEqual(refused.exception.status, "TA_ERROR_INVALID")
+            session = host.spawn("counter").id
+            host.run_until_idle()
+            host.terminate(session)
+            host.run_until_idle()
+            with self.assertRaises(tinyactors.TinyactorsError) as refused:
+                host.migrate(session=session)
+            self.assertEqual(refused.exception.status, "TA_ERROR_STALE")
+            host.run_until_idle()
+        self.assertEqual(done, [])
 
 
 if __name__ == "__main__":

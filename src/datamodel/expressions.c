@@ -33,7 +33,8 @@ int ta_python_support_init(PyObject *module, ta_python_module_state *state) {
     PyObject *namespace = PyDict_New(), *builtins = PyImport_ImportModule("builtins");
     PyObject *name = PyUnicode_FromString("tinyactors._support");
     int status = namespace && builtins && name && PyDict_SetItemString(namespace, "__builtins__", builtins) == 0 &&
-                         PyDict_SetItemString(namespace, "__name__", name) == 0
+                         PyDict_SetItemString(namespace, "__name__", name) == 0 &&
+                         PyDict_SetItemString(namespace, "_tinyactors", module) == 0 /* Address, compile_charts */
                      ? 0
                      : -1;
     Py_XDECREF(name);
@@ -50,6 +51,10 @@ int ta_python_support_init(PyObject *module, ta_python_module_state *state) {
         state->diagnostic = ta_python_support_get(namespace, "Diagnostic");
         state->attach = ta_python_support_get(namespace, "attach");
         state->check_file = ta_python_support_get(namespace, "check_file");
+        state->settlers = ta_python_support_get(namespace, "settlers");
+        state->actor_type = ta_python_support_get(namespace, "Actor");
+        state->host_config = ta_python_support_get(namespace, "host_config");
+        state->host_actors = ta_python_support_get(namespace, "actors");
         PyObject *names = ta_python_support_get(namespace, "BUILTINS");
         state->builtins = PyDict_New();
         for (Py_ssize_t i = 0; names && state->builtins && i < PyTuple_Size(names); i++) {
@@ -63,10 +68,12 @@ int ta_python_support_init(PyObject *module, ta_python_module_state *state) {
         state->event_kinds = Py_BuildValue("(sss)", "platform", "internal", "external");
         state->event_key = PyUnicode_InternFromString("_event");
         if (!state->error || !state->compile_error || !state->resolve_error || !state->diagnostic || !state->attach ||
-            !state->check_file || !names || !state->builtins || !state->time_ns || !state->coroutine_function ||
+            !state->check_file || !state->settlers || !state->actor_type || !state->host_config || !state->host_actors || !names || !state->builtins || !state->time_ns || !state->coroutine_function ||
             !state->event_kinds || !state->event_key)
             status = -1;
-        static const char *const exported[] = {"TinyactorsError", "CompileError", "ResolveError", "Diagnostic"};
+        static const char *const exported[] = {"TinyactorsError", "StaleError", "StateError", "InvalidError",
+                                               "UnsupportedError", "CompileError", "ResolveError", "Diagnostic", "Actor",
+                                               "MemoryStore", "SQLiteStore", "Spawner", "compile_dir"};
         for (size_t i = 0; status == 0 && i < sizeof exported / sizeof exported[0]; i++) {
             PyObject *value = ta_python_support_get(namespace, exported[i]);
             if (!value || PyModule_AddObjectRef(module, exported[i], value) < 0) status = -1;

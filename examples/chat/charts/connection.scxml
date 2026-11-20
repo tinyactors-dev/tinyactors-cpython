@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A connection: one actor per open socket. It forwards what the client
+     sends to the actor it is for and what actors answer to the client,
+     closes the socket when the heartbeat stops, and leaves its rooms when
+     it ends, terminated included. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       name="connection" datamodel="python" initial="connected">
+  <script src="connection.py"/>
+  <datamodel>
+    <data id="user"/>
+    <data id="workspace"/>
+    <data id="rooms" expr="[]"/>          <!-- the names of the rooms joined -->
+  </datamodel>
+  <state id="connected" initial="alive">
+    <onexit>                              <!-- runs on terminate too -->
+      <foreach array="rooms" item="room">
+        <send targetexpr="room_address(workspace, room)" event="leave"/>
+      </foreach>
+    </onexit>
+    <state id="alive">
+      <onentry><send id="heartbeat" event="heartbeat.missed" delay="60s"/></onentry>
+      <onexit><cancel sendid="heartbeat"/></onexit>
+      <transition event="client.heartbeat" target="alive"/>
+    </state>
+
+    <!-- a room that is not there: the sender handles error.communication (strategy C) -->
+    <transition event="client.join">
+      <send id="join" targetexpr="room_address(workspace, _event.data['room'])" event="join">
+        <content expr="{'user': user}"/>
+      </send>
+    </transition>
+    <transition event="error.communication" cond="_event.sendid == 'join'">
+      <send type="chat:gateway" event="deliver"><content expr="frame('error', {'reason': 'no such room'})"/></send>
+    </transition>
+    <transition event="room.joined">
+      <assign location="rooms" expr="added(rooms, _event.data['room'])"/>
+      <send type="chat:gateway" event="deliver"><content expr="frame('room.joined', _event.data)"/></send>
+    </transition>
+    <transition event="client.leave">
+      <send targetexpr="room_address(workspace, _event.data['room'])" event="leave"/>
+      <assign location="rooms" expr="removed(rooms, _event.data['room'])"/>
+    </transition>
+    <transition event="client.post">
+      <send targetexpr="room_address(workspace, _event.data['room'])" event="post">
+        <content expr="{'text': _event.data['text']}"/>
+      </send>
+    </transition>
+    <transition event="client.create">
+      <send targetexpr="workspace_address(workspace)" event="room.create">
+        <content expr="{'user': user, 'name': _event.data['name']}"/>
+      </send>
+    </transition>
+    <transition event="room.created room.refused">
+      <send type="chat:gateway" event="deliver"><content expr="frame(_event.name, _event.data)"/></send>
+    </transition>
+
+    <!-- a direct message: the application routes it (strategy B) -->
+    <transition event="client.dm">
+      <send type="chat:inbox" event="dm">
+        <content expr="{'from': user, 'to': _event.data['to'], 'text': _event.data['text']}"/>
+      </send>
+    </transition>
+    <transition event="dm">
+      <send type="chat:gateway" event="deliver"><content expr="frame('dm', _event.data)"/></send>
+    </transition>
+
+    <transition event="heartbeat.missed" target="closed">
+      <send type="chat:gateway" event="close"><content expr="{'reason': 'timeout'}"/></send>
+    </transition>
+    <transition event="socket.closed" target="closed"/>
+  </state>
+  <final id="closed"/>
+</scxml>

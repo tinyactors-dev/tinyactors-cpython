@@ -1,0 +1,15 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="finishing" initial="s">
+  <state id="s">
+    <transition event="finish" target="f" />
+    <transition event="ping">
+      <send type="urn:test:app" target="app" event="pinged">
+        <content expr="_event.data" />
+      </send>
+    </transition>
+  </state>
+  <final id="f">
+    <donedata>
+      <content expr="_event.data" />
+    </donedata>
+  </final>
+</scxml>

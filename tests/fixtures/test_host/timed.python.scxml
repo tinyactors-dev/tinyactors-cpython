@@ -1,0 +1,21 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="timed" initial="work">
+  <state id="work" initial="a">
+    <onentry>
+      <send id="sla" event="breach" delay="60s" />
+      <send event="tick" delay="1500ms" />
+    </onentry>
+    <history id="h" type="deep">
+      <transition target="a" />
+    </history>
+    <state id="a" initial="a1">
+      <state id="a1">
+        <transition event="next" target="a2" />
+      </state>
+      <state id="a2" />
+    </state>
+    <transition event="pause" target="paused" />
+  </state>
+  <state id="paused">
+    <transition event="resume" target="h" />
+  </state>
+</scxml>

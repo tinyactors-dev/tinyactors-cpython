@@ -1,0 +1,10 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="room" initial="s">
+  <datamodel>
+    <data id="topic" expr="'none'" />
+  </datamodel>
+  <state id="s">
+    <transition event="hello">
+      <log label="room" expr="f'{_name} {topic}'" />
+    </transition>
+  </state>
+</scxml>

@@ -1,6 +1,6 @@
 #!/usr/bin/env ruby
 #MISE description="Test tinyactors-cpython: lint (rules, the binding's C, the adapter, the mapping table, the build scripts, acronyms), the build, the interpreters, and the conformance set named by MILESTONE against the adapter on both datamodels"
-#MISE sources=["src/**/*", "conform/**/*", "tests/**/*", "tools/**/*", "docs/api-map.md", "sgconfig.yml", "pyproject.toml", "mise/**/*", "mise.toml", "../tinyactors-core/include/**/*", "../tinyactors-core/src/**/*", "../tinyactors-core/third_party/**/*", "../tinyactors-core/mise/**/*", "../tinyactors-core/tools/lint/utils/**/*", "../tinyactors-core/docs/requests.md", "../tinyactors-test/suites/**/*", "../tinyactors-test/lib/**/*", "../tinyactors-test/lint/**/*", "../tinyactors-test/mise/**/*", "../tinyactors-test/mise.toml", "../mise/lib/**/*", "../mise/ast-grep/**/*", "../sgconfig.yml", "../acronyms.txt", "../acronyms-allow.txt", "../mise.toml", "../LICENSE"]
+#MISE sources=["src/**/*", "conform/**/*", "tests/**/*", "examples/**/*", "tools/**/*", "docs/api-map.md", "sgconfig.yml", "pyproject.toml", "mise/**/*", "mise.toml", "../tinyactors-core/include/**/*", "../tinyactors-core/src/**/*", "../tinyactors-core/third_party/**/*", "../tinyactors-core/mise/**/*", "../tinyactors-core/tools/lint/utils/**/*", "../tinyactors-core/docs/requests.md", "../tinyactors-test/suites/**/*", "../tinyactors-test/lib/**/*", "../tinyactors-test/lint/**/*", "../tinyactors-test/mise/**/*", "../tinyactors-test/mise.toml", "../mise/lib/**/*", "../mise/ast-grep/**/*", "../sgconfig.yml", "../acronyms.txt", "../acronyms-allow.txt", "../mise.toml", "../LICENSE"]
 #MISE outputs={auto=true}
 #USAGE flag "--full" help="the hibernation, migration and snapshot gates at 2,000,000 actors, 1000 resident, snapshots of 100,000 resident actors, and 200,000 invoked services"
 # vim:ft=ruby
@@ -11,7 +11,9 @@
 # task from the root's `mise run test` (AGENTS.md, "Tests: what to run").
 #
 # It lints, builds the extension for both interpreters and runs tests/ on
-# each with its build on PYTHONPATH (unittest, the standard library's).
+# each with its build on PYTHONPATH (unittest, the standard library's),
+# then each example application's tests (examples/<name>/test_*.py, from
+# its own directory, so it imports its own modules).
 # The conformance suite needs the adapter (conform/): with it, the part of
 # the set named by CPython::MILESTONE that CPython::GATE holds now must
 # pass (`mise run conform -- --milestone <it> --suite <each>`, on the
@@ -48,6 +50,11 @@ else
     puts "test: python #{version}, the #{build.name} build: tests/"
     CPython.run(build.python, '-m', 'unittest', 'discover', '--start-directory', 'tests',
                 env: { 'PYTHONPATH' => build.directory.to_s })
+    CPython.examples.each do |example|
+      puts "test: python #{version}, the #{build.name} build: #{example.relative_path_from(CPython::ROOT)}/"
+      CPython.run(build.python, '-m', 'unittest', 'discover', '--start-directory', example.to_s,
+                  env: { 'PYTHONPATH' => build.directory.to_s })
+    end
   end
 end
 

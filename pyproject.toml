@@ -5,7 +5,7 @@
 # decision 2). The release sets the version.
 [project]
 name = "tinyactors"
-version = "0.1.0"
+version = "0.4.0"
 description = "SCXML statecharts as actors, with chart logic in Python"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -26,6 +26,6 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/dhamidi/tinyactors/tree/main/tinyactors-cpython#readme"
-Repository = "https://github.com/dhamidi/tinyactors"
-Issues = "https://github.com/dhamidi/tinyactors/issues"
+Homepage = "https://github.com/tinyactors-dev/tinyactors/tree/main/tinyactors-cpython#readme"
+Repository = "https://github.com/tinyactors-dev/tinyactors"
+Issues = "https://github.com/tinyactors-dev/tinyactors/issues"

@@ -60,7 +60,7 @@ class Counter:
     def __init__(self, invocation, world):
         self.invocation, self.count, self.world = invocation, 0, world
 
-    def receive(self, host, send):
+    def receive(self, send):
         if send.event == "ping":
             self.count += 1
             if send.data["n"] > self.count - 1:  # never more pongs counted than sent (some may be on their way)
@@ -71,7 +71,7 @@ class Counter:
             self.invocation.done({"total": self.count})
             self.world.done.add(self.invocation.session)
 
-    def stop(self, host):
+    def stop(self):
         session = self.invocation.session
         if session in self.world.stopped:
             self.world.failures.append("session %d stopped twice" % session)
@@ -83,7 +83,7 @@ class World:
         self.failures, self.started, self.done, self.stopped, self.reports = [], {}, set(), set(), {}
         self.alive = set()  # weak references to every service: the host holds the running ones only
 
-    def start(self, host, invocation):
+    def start(self, invocation):
         if invocation.session in self.started:
             self.failures.append("session %d invoked twice" % invocation.session)
         if invocation.type != COUNTER or invocation.src != "counter://local" or invocation.invokeid != "counter":
@@ -93,7 +93,7 @@ class World:
         self.alive.add(weakref.ref(service))
         return service
 
-    def log(self, host, entry):
+    def log(self, entry):
         session, pongs, total, state = entry.text.split()
         self.reports[int(session)] = (int(pongs), int(total), state)
 
@@ -113,19 +113,17 @@ def main():
     # maxEvents counts the actors too; the "python" datamodel lets its events go. The counter's
     # instance fits in 128 B, its strings in 16; tracing off (nobody exports the traces here).
     events = 16384 + (room if options.datamodel == "ecmascript" else 0)
-    config = {"systemID": "services", "system": {"maxActors": room, "maxRequests": room, "maxEvents": events,
-                                                 "instanceBytes": 128 * room, "stringBytes": 16384 + 16 * room,
-                                                 "tracing": False}}
-    host = tinyactors.Host(config, log=world.log, services={COUNTER: world.start})
+    config = {"system": {"maxActors": room, "maxRequests": room, "maxEvents": events,
+                         "instanceBytes": 128 * room, "stringBytes": 16384 + 16 * room, "tracing": False}}
     with tinyactors.compile_charts([("client.scxml", read_chart("client", options.datamodel))]) as compiled:
-        host.add_image(compiled.image)
-    chart = host.chart("client")
+        host = tinyactors.Host(compiled, system="services", config=config, log=world.log,
+                               services={COUNTER: world.start})
 
     # 1. start: every actor invokes a counter
     started = time.perf_counter()
     sessions = array.array("Q")
     for i in range(options.actors):
-        sessions.append(host.spawn(chart, params={"seed": i}))
+        sessions.append(host.spawn("client", params={"seed": i}).id)
         if i % BATCH == BATCH - 1:
             host.run_until_idle()
     host.run_until_idle()
@@ -190,7 +188,7 @@ def main():
         world.failures.append("the host holds %d services, %d still run" % (
             running, options.actors - len(finishing) - len(leaving)))
     got = []
-    host.host_stats(lambda host, result: got.append(result["host"]))
+    host.host_stats(lambda result: got.append(result["host"]))
     host.run_until_idle()
     region = got[0]["regionBytes"]
     host.close()

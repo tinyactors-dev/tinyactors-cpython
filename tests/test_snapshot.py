@@ -1,27 +1,26 @@
 """Snapshots: Host.snapshot and Host.restore, on both datamodels."""
 
+import asyncio
 import unittest
 
 import tinyactors
 from support import Logs, element, find, fixture, load, text
 
-CONFIG = {"systemID": "t", "system": {"ticksPerSecond": 1000}}
+CONFIG = {"system": {"ticksPerSecond": 1000}}
 COUNTER = {datamodel: fixture("test_snapshot/counter.%s.scxml" % datamodel) for datamodel in ("python", "ecmascript")}
 
 
 def host_of(document, **options):
     options.setdefault("clock", tinyactors.SimulatedClock())
-    host = tinyactors.Host(CONFIG, **options)
     with tinyactors.compile_charts([("counter.scxml", document)]) as compiled:
-        host.add_image(compiled.image)
-    return host
+        return tinyactors.Host(compiled, system="t", config=CONFIG, **options)
 
 
 class Snapshot(unittest.TestCase):
     def round_trip(self, datamodel):
         logs, clock = Logs(), tinyactors.SimulatedClock()
         with host_of(COUNTER[datamodel], log=logs, clock=clock) as host:
-            session = host.spawn(host.chart("counter"))
+            session = host.spawn("counter").id
             host.send(session, "inc", {"k": 1})
             host.send(session, "inc", "two")
             host.send(session, "wait")
@@ -31,14 +30,14 @@ class Snapshot(unittest.TestCase):
         self.assertIsInstance(blob, bytes)
         # a new clock that starts at 0: the restored host goes on from the snapshot's time
         logs, clock = Logs(), tinyactors.SimulatedClock()
-        with tinyactors.Host.restore(blob, CONFIG, log=logs, clock=clock) as host:
+        with tinyactors.Host.restore(blob, [], system="t", config=CONFIG, log=logs, clock=clock) as host:
             host.send(session, "report", str(session))
             host.run_until_idle()
             self.assertEqual(logs.labelled("late"), [])
             clock.increment(0.999)
             self.assertEqual(logs.labelled("late"), [])
             clock.increment(0.001)
-            other = host.spawn(host.chart("counter"))
+            other = host.spawn("counter").id
             self.assertNotEqual(other, session)
         return logs
 
@@ -58,34 +57,30 @@ class Snapshot(unittest.TestCase):
                 clock = tinyactors.SimulatedClock()
                 with host_of(COUNTER[datamodel], clock=clock) as host:
                     for _ in range(5):
-                        session = host.spawn(host.chart("counter"))
+                        session = host.spawn("counter").id
                         host.send(session, "inc", [session])
                         host.send(session, "wait")
                     host.run_until_idle()
                     blob = host.snapshot()
-                with tinyactors.Host.restore(blob, CONFIG, clock=clock) as host:
+                with tinyactors.Host.restore(blob, [], system="t", config=CONFIG, clock=clock) as host:
                     self.assertEqual(host.snapshot(), blob)
 
     def test_a_hibernated_actor_wakes_after_a_restore(self):
-        logs, blobs = Logs(), {}
-
-        def wake(host, session, migration):
-            host.wake(session, blobs.pop(session))
-
+        logs, store = Logs(), tinyactors.MemoryStore()
         with host_of(COUNTER["python"]) as host:
-            session = host.spawn(host.chart("counter"))
+            session = host.spawn("counter").id
             host.send(session, "inc", 1)
             host.run_until_idle()
-            blobs[session] = host.hibernate(session)
+            store.save(session, host.hibernate(session))
             blob = host.snapshot()
-        with tinyactors.Host.restore(blob, CONFIG, log=logs, wake=wake, clock=tinyactors.SimulatedClock()) as host:
+        with tinyactors.Host.restore(blob, [], system="t", config=CONFIG, log=logs, store=store, clock=tinyactors.SimulatedClock()) as host:
             host.send(session, "report", 0)
             host.run_until_idle()
         self.assertEqual(logs.labelled("n"), ["1 [1] report False"])
 
     def test_a_value_outside_the_table_refuses_the_snapshot(self):
         with host_of(COUNTER["python"]) as host:
-            session = host.spawn(host.chart("counter"))
+            session = host.spawn("counter").id
             host.send(session, "odd")
             host.run_until_idle()
             with self.assertRaises(tinyactors.TinyactorsError) as raised:
@@ -97,31 +92,31 @@ class Snapshot(unittest.TestCase):
     def test_a_snapshot_from_a_handler_is_refused(self):
         refused = []
 
-        def log(host, entry):
+        def log(entry):
             try:
                 host.snapshot()
             except tinyactors.TinyactorsError as error:
                 refused.append(error.status)
 
         with host_of(COUNTER["python"], log=log) as host:
-            session = host.spawn(host.chart("counter"))
+            session = host.spawn("counter").id
             host.send(session, "report", 0)
             host.run_until_idle()
         self.assertEqual(refused, ["TA_ERROR_STATE"])
 
     def test_restore_refuses_what_is_no_snapshot(self):
         with self.assertRaises(tinyactors.TinyactorsError):
-            tinyactors.Host.restore(b"\x00" * 64, CONFIG)
+            tinyactors.Host.restore(b"\x00" * 64, [], system="t", config=CONFIG)
         with self.assertRaises(TypeError):
             tinyactors.Host.restore()
 
     def test_a_snapshot_restores_from_an_unaligned_buffer(self):
         with host_of(COUNTER["python"]) as host:
-            host.spawn(host.chart("counter"))
+            host.spawn("counter").id
             host.run_until_idle()
             blob = host.snapshot()
         shifted = memoryview(b"x" + blob)[1:]
-        with tinyactors.Host.restore(shifted, CONFIG, clock=tinyactors.SimulatedClock()) as host:
+        with tinyactors.Host.restore(shifted, [], system="t", config=CONFIG, clock=tinyactors.SimulatedClock()) as host:
             self.assertEqual(host.snapshot(), blob)
 
     def test_one_image_in_two_segments_keeps_each_sessions_chart(self):
@@ -133,14 +128,13 @@ class Snapshot(unittest.TestCase):
                 document.append(element("final", id="f"))
                 with tinyactors.compile_charts([("counter.scxml", text(document))]) as compiled:
                     image = bytes(compiled.image)
-                with tinyactors.Host(CONFIG, clock=clock) as host:
-                    host.add_image(image)
-                    first = host.spawn(host.chart("counter"))
+                with tinyactors.Host(image, system="t", config=CONFIG, clock=clock) as host:
+                    first = host.spawn("counter").id
                     host.add_image(image)  # the same image again: another segment
-                    second = host.spawn(host.chart("counter"))
+                    second = host.spawn("counter").id
                     host.run_until_idle()
                     blob = host.snapshot()
-                with tinyactors.Host.restore(blob, CONFIG, log=logs, clock=clock) as host:
+                with tinyactors.Host.restore(blob, [], system="t", config=CONFIG, log=logs, clock=clock) as host:
                     host.send(first, "stop")
                     host.run_until_idle()
                     host.run_until_idle()  # the first segment retires
@@ -157,14 +151,17 @@ class Snapshot(unittest.TestCase):
         second away."""
         logs = Logs()
         with host_of(COUNTER["python"]) as host:
-            session = host.spawn(host.chart("counter"))
+            session = host.spawn("counter").id
             host.send(session, "wait")
             host.run_until_idle()
             blob = host.snapshot()
-        with tinyactors.Host.restore(blob, CONFIG, log=logs) as host:
-            host.run_until_idle()
-            self.assertEqual(logs.labelled("late"), [])
-            host.run()  # sleeps to the deadline: about a second
+        async def restored():
+            async with tinyactors.Host.restore(blob, [], system="t", config=CONFIG, log=logs) as host:
+                await host.idle()
+                self.assertEqual(logs.labelled("late"), [])
+                await asyncio.sleep(host.next_deadline + 0.05)  # the loop's timer fires at the deadline
+                await host.idle()
+        asyncio.run(restored())
         self.assertEqual(logs.labelled("late"), ["{'k': 0}"])
 
     def test_a_value_nests_as_deep_in_a_snapshot_as_in_a_send(self):
@@ -173,11 +170,11 @@ class Snapshot(unittest.TestCase):
             deep = [deep]
         logs = Logs()
         with host_of(COUNTER["python"]) as host:
-            session = host.spawn(host.chart("counter"))
+            session = host.spawn("counter").id
             host.send(session, "inc", deep)
             host.run_until_idle()
             blob = host.snapshot()
-        with tinyactors.Host.restore(blob, CONFIG, log=logs, clock=tinyactors.SimulatedClock()) as host:
+        with tinyactors.Host.restore(blob, [], system="t", config=CONFIG, log=logs, clock=tinyactors.SimulatedClock()) as host:
             host.send(session, "report", 0)
             host.run_until_idle()
         self.assertTrue(logs.labelled("n")[0].startswith("1 [[[["))
@@ -186,11 +183,28 @@ class Snapshot(unittest.TestCase):
         with host_of(COUNTER["python"]) as host:
             blob = host.snapshot()
         with self.assertRaisesRegex(ValueError, "system t"):
-            tinyactors.Host.restore(blob, {"systemID": "other"})
+            tinyactors.Host.restore(blob, [], system="other")
+
+    def test_restore_adds_the_charts_the_snapshot_does_not_hold(self):
+        """Host.restore's charts are what the application runs now: an image
+        the snapshot holds stays one segment, a new one is added."""
+        with tinyactors.compile_charts([("counter.scxml", COUNTER["python"])]) as compiled:
+            image = compiled.image
+        with tinyactors.compile_charts([("counter.scxml", COUNTER["ecmascript"])]) as compiled:
+            newer = compiled.image
+        with host_of(COUNTER["python"]) as host:
+            blob = host.snapshot()
+        for charts, segments in (([], 1), (image, 1), ([image, newer], 2)):
+            with self.subTest(segments=segments):
+                got = []
+                with tinyactors.Host.restore(blob, charts, system="t", config=CONFIG) as host:
+                    host.host_stats(lambda result: got.append(result["host"]["segments"]))
+                    host.run_until_idle()
+                self.assertEqual(got, [segments])
 
     def test_a_snapshot_with_a_reply_pending_is_refused(self):
         with host_of(COUNTER["python"]) as host:
-            host.host_stats(lambda host, result: None)
+            host.host_stats(lambda result: None)
             with self.assertRaises(tinyactors.TinyactorsError) as raised:
                 host.snapshot()
             self.assertEqual(raised.exception.status, "TA_ERROR_STATE")

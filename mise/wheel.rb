@@ -88,7 +88,7 @@ module CPython
     # core's amalgamation and src/ compiled with zig for the target and
     # linked as a module the interpreter loads (Target#plugin). Answers its
     # path.
-    def build(name)
+    def build(name, version:)
       target = Toolchain::Target.release(name)
       dir = BUILD.join('release', name)
       core = CORE_SOURCES.map do |file, flags|
@@ -100,7 +100,7 @@ module CPython
       objects = Dir[ROOT.join(SOURCES).to_s].sort.map do |source|
         relative = Pathname.new(source).relative_path_from(ROOT.join('src')).sub_ext('.o')
         CPython.compile(target, source, dir.join('objects/src', relative),
-                        [*FLAGS, *includes, '-DPy_LIMITED_API=0x030D0000'])
+                        [*FLAGS, *includes, CPython.version_define(version), '-DPy_LIMITED_API=0x030D0000'])
       end
       extension = dir.join('tinyactors.abi3.so')
       target.plugin([*objects, *core].map(&:to_s), into: extension.to_s)
@@ -126,10 +126,7 @@ module CPython
 
     # pyproject.toml's [project] table, read by the pinned python's tomllib
     # (Ruby has no TOML parser).
-    def project
-      script = 'import json, sys, tomllib; print(json.dumps(tomllib.load(open(sys.argv[1], "rb"))["project"]))'
-      JSON.parse(IO.popen([CPython.pinned('python'), '-c', script, ROOT.join('pyproject.toml').to_s], &:read))
-    end
+    def project = CPython.project
 
     # The wheel's file name (PEP 427, with PEP 425's compressed tag set).
     def file_name(version, name)
@@ -200,7 +197,7 @@ module CPython
       commit = Release.git('rev-parse', 'HEAD').to_s.strip
       epoch = Release.git('show', '-s', '--format=%ct', 'HEAD').to_i
       names.to_h do |name|
-        wheel = pack(name, build(name), version: version, out: out, commit: commit, epoch: epoch)
+        wheel = pack(name, build(name, version: version), version: version, out: out, commit: commit, epoch: epoch)
         puts "wheel: #{wheel.relative_path_from(ROOT)} (#{wheel.size / 1024} KiB)"
         [name, wheel]
       end

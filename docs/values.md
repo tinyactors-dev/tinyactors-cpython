@@ -21,8 +21,10 @@ dictionary does. The codec accepts neutral values, not arbitrary CBOR tags.
 Use `tinyactors.Address(text)` when the value must keep an actor reference
 across a process boundary. The constructor takes one positional exact
 `str`, validates its UTF-8 representation and core's text-length limit,
-and retains it. It does not parse a URI, find an actor or validate a route.
-An ordinary string is still encoded as ordinary text.
+and retains it. It does not find an actor or validate a route. Its
+`.system`, `.session` and `.name` are the parts core's address parser
+reads, each `None` when the text is no tinyactors address or has no such
+part. An ordinary string is still encoded as ordinary text.
 
 ```python
 from tinyactors import Address, decode, encode
@@ -31,6 +33,7 @@ player = Address("tinyactors://tab-7f3/#_scxml_4")
 restored = decode(encode({"player": player}))["player"]
 assert restored == player
 assert restored.text == str(player)
+assert (player.system, player.session, player.name) == ("tab-7f3", 4, None)
 ```
 
 An `Address` is immutable and cannot be subclassed. Its read-only `.text`
@@ -98,5 +101,5 @@ value itself, or quickjs's payload decoded on first read. A `"python"`
 chart's `<send>` data, `<donedata>` and invoke params are copied the same
 way when they are captured, so actors share no mutable value; a value
 outside the table (a tuple, a set, an object) fails the capture with
-`error.execution`. Toward another system the value is the remote I/O
-processor's to encode; `tinyactors.encode` gives the value table's CBOR.
+`error.execution`. Toward another system the value is the transport's
+to encode; `tinyactors.encode` gives the value table's CBOR.

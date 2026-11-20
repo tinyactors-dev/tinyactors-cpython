@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A room: never ends and hibernates when idle (strategy A). When it
+     starts it saves itself and announces itself to its workspace. -->
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0"
+       name="room" datamodel="python" initial="open">
+  <script src="room.py"/>
+  <datamodel>
+    <data id="workspace"/>
+    <data id="name"/>
+    <data id="history" expr="[]"/>        <!-- recent messages; from the database after a restart -->
+    <data id="members" expr="{}"/>        <!-- #_scxml_<connection> -> user: sender(_event.origin) -->
+  </datamodel>
+  <state id="open">
+    <onentry>
+      <send type="chat:db" event="room.save"><content expr="{'workspace': workspace, 'name': name}"/></send>
+      <send targetexpr="workspace_address(workspace)" event="room.opened"><content expr="{'name': name}"/></send>
+    </onentry>
+    <transition event="join">
+      <assign location="members" expr="with_entry(members, sender(_event.origin), _event.data['user'])"/>
+      <send targetexpr="_event.origin" event="room.joined">
+        <content expr="{'room': name, 'history': recent(history)}"/>
+      </send>
+    </transition>
+    <transition event="leave">
+      <assign location="members" expr="without_entry(members, sender(_event.origin))"/>
+    </transition>
+    <transition event="post" cond="sender(_event.origin) in members">
+      <assign location="history" expr="remember(history, message(name, members, _event))"/>
+      <send type="chat:db" event="message.insert">
+        <content expr="stored(workspace, name, members, _event)"/>
+      </send>
+      <send type="chat:gateway" event="broadcast">
+        <content expr="{'to': list(members), 'event': 'room.message', 'data': message(name, members, _event)}"/>
+      </send>
+    </transition>
+    <transition event="members.gone">     <!-- the gateway found no socket for them -->
+      <assign location="members" expr="without_all(members, _event.data['members'])"/>
+    </transition>
+    <transition event="members">          <!-- an ask: the reply goes to _event.origin -->
+      <send targetexpr="_event.origin" event="members"><content expr="{'members': users(members)}"/></send>
+    </transition>
+    <transition event="kick">             <!-- an ask too -->
+      <assign location="members" expr="without_user(members, _event.data['user'])"/>
+      <send targetexpr="_event.origin" event="kicked"><content expr="{'members': users(members)}"/></send>
+    </transition>
+    <transition event="error.communication"/>   <!-- a workspace that is not there: nothing to do -->
+  </state>
+</scxml>

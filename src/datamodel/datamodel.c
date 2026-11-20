@@ -97,6 +97,7 @@ void ta_python_datamodel_free(ta_python_datamodel *datamodel) {
     Py_CLEAR(datamodel->namespace);
     Py_CLEAR(datamodel->raised);
     Py_CLEAR(datamodel->output);
+    Py_CLEAR(datamodel->failure);
     Py_CLEAR(datamodel->origintypes);
     if (datamodel->wire.pointer) {
         const ta_allocator *allocator = &datamodel->host->allocator;
@@ -110,6 +111,7 @@ int ta_python_datamodel_traverse(ta_python_datamodel *datamodel, visitproc visit
     Py_VISIT(datamodel->namespace);
     Py_VISIT(datamodel->raised);
     Py_VISIT(datamodel->output);
+    Py_VISIT(datamodel->failure);
     Py_VISIT(datamodel->origintypes);
     return datamodel->state ? ta_python_rows_traverse(datamodel, visit, arg) : 0;
 }
@@ -140,6 +142,7 @@ static int ta_python_scope_enter(const ta_datamodel_call *call, ta_python_scope 
     scope->functions = Py_NewRef(chart->functions);
     scope->saved = datamodel->environment;
     datamodel->environment = call->environment;
+    datamodel->failure_reason = TA_DATAMODEL_FAILURE_NONE; /* a new entry: the last one's failure is forgotten */
     if (call->environment) ta_datamodel_environment_charge(call->environment, 1); /* fuel once per evaluation */
     return 0;
 }
@@ -157,8 +160,32 @@ static ta_status ta_python_failed(ta_python_datamodel *datamodel) {
     PyObject *raised = PyErr_GetRaisedException();
     if (raised && !PyErr_GivenExceptionMatches(raised, PyExc_Exception) && !datamodel->raised)
         datamodel->raised = Py_NewRef(raised);
+    /* what the chart's error.execution says (ta_python_failure): the error path only */
+    datamodel->failure_reason = raised && PyErr_GivenExceptionMatches(raised, PyExc_MemoryError)
+                                    ? TA_DATAMODEL_FAILURE_MEMORY
+                                    : TA_DATAMODEL_FAILURE_EXCEPTION;
+    PyObject *name = raised ? PyType_GetName(Py_TYPE(raised)) : NULL;
+    PyObject *text = name ? PyUnicode_FromFormat("%U: %S", name, raised) : NULL;
+    if (!text) PyErr_Clear();
+    ta_python_replace(&datamodel->failure, text);
+    Py_XDECREF(name);
     Py_XDECREF(raised);
     return TA_ERROR_EXECUTION;
+}
+
+/* Why the last entry failed, once (datamodel.h): its exception's type and
+ * text, the UTF-8 of a str the datamodel holds until its next entry. */
+static ta_status ta_python_failure(const ta_datamodel_call *call, ta_datamodel_failure *out) {
+    ta_python_datamodel *datamodel = call->datamodel;
+    out->reason = datamodel->failure_reason;
+    datamodel->failure_reason = TA_DATAMODEL_FAILURE_NONE;
+    Py_ssize_t length = 0;
+    const char *text = out->reason == TA_DATAMODEL_FAILURE_EXCEPTION && datamodel->failure
+                           ? PyUnicode_AsUTF8AndSize(datamodel->failure, &length)
+                           : NULL;
+    if (!text) PyErr_Clear(); /* a lone surrogate: no message */
+    out->message = (ta_string_view){text ? text : "", text ? (uint32_t)length : 0};
+    return TA_OK;
 }
 
 /* The compiled form of expression `e` (borrowed), or NULL with the
@@ -1262,6 +1289,7 @@ static const ta_datamodel_vtable ta_python_vtable = {
     .payload_serialize = ta_python_payload_serialize, /* a delayed send's payload in an export blob: its CBOR */
     .payload_deserialize = ta_python_from_wire,
     .variable = ta_python_variable,
+    .failure = ta_python_failure,
 };
 
 const ta_datamodel_vtable *ta_python_datamodel_vtable(void) {

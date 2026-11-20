@@ -1,0 +1,10 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="asked" initial="s">
+  <state id="s">
+    <transition event="question">
+      <send targetexpr="_event.origin" event="answer">
+        <content expr="{'echo': _event.data}" />
+      </send>
+    </transition>
+    <transition event="silent" />
+  </state>
+</scxml>

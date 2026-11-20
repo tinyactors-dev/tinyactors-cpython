@@ -7,8 +7,9 @@ The application's side of snapshots (README, "Snapshots"), as a program
 would write it to try a new chart version on a copy of production before
 deploying it:
 
-1. live: N order actors of version 1, at most R resident, the rest
-   hibernated into SQLite (tools/stress.py's store); E events to actors
+1. live: N order actors of version 1, at most R resident after a turn,
+   the rest hibernated into SQLite by the host (Host(store=...,
+   resident=R), tools/stress.py's store); E events to actors
    drawn at random; every resident actor gets a delayed send due in 10 s,
    and half of them start paying: each invokes the payment service
    (<invoke type="urn:example:payment">, its amount as a param), which the
@@ -23,8 +24,9 @@ deploying it:
    in flight; the stand-in gets each (invocation.restored, the same amount)
    and declines it;
 4. rehearse: the copy adds version 2 and migrates every actor to it
-   (Host.migrate, waking the hibernated ones a batch at a time from the
-   copy's store, as tools/migration.py does), with E more events, then
+   (Host.migrate(wake=True): the copy's host loads the hibernated ones
+   from the copy's store as room allows, as in tools/migration.py), with
+   E more events, then
    runs its clock past the delayed sends;
 5. verify the copy: the migration migrated every actor, none failed; a sample
    (all up to 25,000) reports its count (every event, before and after
@@ -35,8 +37,8 @@ deploying it:
    reports version 1, its own counts, payments still in flight; the real
    service was started once per payer and never stopped, and every blob
    in the live store is the last one the live host wrote for its session
-   (the copy wrote into its own). After every eviction, on both hosts, at
-   most R actors are resident (plus two batches while migrating).
+   (the copy wrote into its own). After every turn, on both hosts, at
+   most R actors are resident (plus a batch while migrating).
 
 With R = N every actor stays resident, so the datamodels' own state is most
 of the snapshot. Exits with status 1 when a check fails. Prints the times,
@@ -46,7 +48,6 @@ the sizes, the process's peak memory and the hosts' regions per actor.
 import argparse
 import hashlib
 import array
-import collections
 import os
 import random
 import resource
@@ -65,74 +66,49 @@ def index(session):
     return (session & 0xFFFFFFFF) - 1  # segment 0 numbers its sessions 1, 2, ...
 
 
+class Written(Store):
+    """A host's store that remembers, per actor, the crc32 + 1 of the last
+    blob it saved (0 once deleted: the actor is resident)."""
+
+    def __init__(self, path, written):
+        super().__init__(path)
+        self.written = written
+
+    def save(self, session, blob):
+        self.written[index(session)] = zlib.crc32(blob) + 1
+        super().save(session, blob)
+
+    def delete(self, session):
+        self.written[index(session)] = 0
+        super().delete(session)
+
+
 class Population:
-    """One host's actors: its store, the resident ones (least recently used
-    first), the migration's wake queue, the reports; as tools/migration.py."""
+    """One host's actors: its store, the reports, the migration's moves."""
 
     def __init__(self, name, store, options, failures):
         self.name, self.store, self.options, self.failures = name, store, options, failures
-        self.resident = collections.OrderedDict()
         self.moved = bytearray(options.actors)   # 1: migrated (the MIGRATED effect)
-        self.queued = bytearray(options.actors)  # 1: the migration asked for it, waiting in `asked`
-        self.asked = collections.deque()
-        self.reports, self.wakes, self.moves, self.peak = {}, 0, 0, 0
+        self.reports, self.moves, self.peak = {}, 0, 0
         self.migrating, self.migration_done = False, None
-        self.written = array.array("Q", bytes(8 * options.actors))  # crc32 + 1 of the last blob it put
 
-    def wake_now(self, host, session):
-        host.wake(session, self.store.get(session))
-        self.resident[session] = None
-        self.wakes += 1
+    def resident(self, sessions):
+        """The sessions of `sessions` in memory: those without a blob in the store."""
+        return [session for session in sessions if not self.store.written[index(session)]]
 
-    def wake(self, host, session, migration):
-        if migration:  # the migration asks: in its order, a batch at a time
-            if not self.queued[index(session)]:
-                self.queued[index(session)] = 1
-                self.asked.append(session)
-            return
-        self.wake_now(host, session)  # an event's or a timer's: at once
-
-    def migrated(self, host, entry):
+    def migrated(self, entry):
         if self.moved[index(entry.session)]:
             self.failures.append("%s: actor %d moved twice" % (self.name, entry.session))
         self.moved[index(entry.session)] = 1
         self.moves += 1
 
-    def log(self, host, entry):
+    def log(self, entry):
         session, n, late, paid, version = entry.text.split()
         self.reports[int(session)] = (int(n), int(late), int(paid), int(version))
 
-    def hibernate(self, host, session):
-        try:
-            blob = host.hibernate(session)
-            self.written[index(session)] = zlib.crc32(blob) + 1
-            self.store.put(session, blob)
-        except tinyactors.TinyactorsError as error:
-            if error.status != "TA_ERROR_STATE":
-                raise
-            return False  # not at rest, or paying (an invocation keeps it in memory): it stays
-        self.resident.pop(session, None)
-        return True
-
-    def evict(self, host):
-        """Down to R resident: cold actors first, then the least recently
-        used; while migrating, only the actors that moved already."""
-        def may(session):
-            return not self.migrating or self.moved[index(session)]
-
-        while len(self.resident) > self.options.resident:
-            cold = [s for s in host.sweep(1 << 20, len(self.resident) - self.options.resident) if may(s)]
-            if not sum(self.hibernate(host, session) for session in cold):
-                break
-        for session in list(self.resident):  # payers stay (an invocation keeps an actor in memory)
-            if len(self.resident) <= self.options.resident:
-                break
-            if may(session):
-                self.hibernate(host, session)
-
     def check_resident(self, host, slack=0):
         got = []
-        host.host_stats(lambda host, result: got.append(result["host"]))
+        host.host_stats(lambda result: got.append(result["host"]))
         host.run_until_idle()
         stats = got[0]
         live = stats["actors"] - stats["hibernated"]
@@ -151,7 +127,7 @@ class Payments:
     def __init__(self, decline):
         self.decline, self.started, self.stopped, self.amounts, self.restored = decline, {}, set(), {}, 0
 
-    def start(self, host, invocation):
+    def start(self, invocation):
         self.started[invocation.session] = self.started.get(invocation.session, 0) + 1
         self.amounts[invocation.session] = invocation.data["amount"]
         self.restored += invocation.restored
@@ -168,7 +144,7 @@ class Payment:
     def __init__(self, payments, session):
         self.payments, self.session = payments, session
 
-    def stop(self, host):
+    def stop(self):
         if self.session in self.payments.stopped:
             self.payments.stopped.add(-self.session)  # twice: the check below sees it
         self.payments.stopped.add(self.session)
@@ -192,20 +168,17 @@ def main():
     # sized as tools/stress.py's (instance 128 B and strings 16 B per resident actor, tracing off);
     # events: a delayed send per resident actor, and after the restore the stand-in's declines
     # (quickjs keeps each actor's last event too)
-    config = {"systemID": "orders", "system": {"ticksPerSecond": 1000,
-                                               "maxActors": options.actors + 4 * BATCH,
-                                               "maxEvents": 4096 + 3 * resident_room, "maxTimers": resident_room,
-                                               "maxRequests": resident_room,
-                                               "instanceBytes": 128 * resident_room,
-                                               "stringBytes": 16384 + 16 * resident_room, "tracing": False}}
-    live_store = Store(os.path.join(directory.name, "live.db"))
+    config = {"system": {"ticksPerSecond": 1000, "maxActors": options.actors + 4 * BATCH,
+                         "maxEvents": 4096 + 3 * resident_room, "maxTimers": resident_room,
+                         "maxRequests": resident_room, "instanceBytes": 128 * resident_room,
+                         "stringBytes": 16384 + 16 * resident_room, "tracing": False}}
+    live_store = Written(os.path.join(directory.name, "live.db"), array.array("Q", bytes(8 * options.actors)))
     live = Population("live", live_store, options, failures)
     real = Payments(decline=False)
     live_clock = tinyactors.SimulatedClock()
-    host = tinyactors.Host(config, wake=live.wake, log=live.log, clock=live_clock, services={PAYMENT: real.start})
     with tinyactors.compile_charts([("order.scxml", v1)]) as compiled:
-        host.add_image(compiled.image)
-    chart = host.chart("order")
+        host = tinyactors.Host(compiled, system="orders", config=config, log=live.log, clock=live_clock,
+                               services={PAYMENT: real.start}, store=live_store, resident=options.resident)
     sessions = array.array("Q")
     sent = array.array("I", bytes(4 * options.actors))       # events before the snapshot
     sent_live = array.array("I", bytes(4 * options.actors))  # the live host's after it
@@ -218,30 +191,22 @@ def main():
                 i = random.randrange(options.actors)
                 counts[i] += 1
                 items.append((sessions[i], "inc", {"k": i}))
-                if sessions[i] in population.resident:
-                    population.resident.move_to_end(sessions[i])
             if host.send_many(items) != len(items):
                 failures.append("%s: send_many refused events" % population.name)
             host.run_until_idle()
-            if not population.migrating:
-                population.evict(host)
-                population.check_resident(host)
+            population.check_resident(host, BATCH if population.migrating else 0)
 
     # 1. live: populate, events, delayed sends, payments in flight
     started = time.perf_counter()
     for i in range(options.actors):
-        session = host.spawn(chart)
-        sessions.append(session)
-        live.resident[session] = None
-        if len(live.resident) >= options.resident + BATCH:
+        sessions.append(host.spawn("order").id)
+        if i % BATCH == BATCH - 1:
             host.run_until_idle()
-            live.evict(host)
     host.run_until_idle()
-    live.evict(host)
     if sessions and sessions[-1] != sessions[0] + options.actors - 1:
         failures.append("the sessions are not numbered 1..N in segment 0: index() is wrong")
     traffic(live, host, sent, options.events)
-    waiting = list(live.resident)
+    waiting = live.resident(sessions)
     payers = waiting[::2]
     for first in range(0, len(waiting), BATCH):
         host.send_many([(s, "wait") for s in waiting[first:first + BATCH]])
@@ -263,8 +228,9 @@ def main():
     path = os.path.join(directory.name, "orders.snapshot")
     with open(path, "wb") as file:
         file.write(blob)
-    in_memory = list(live.resident)  # resident at the snapshot: resident in the copy too
-    copy_store = Store(os.path.join(directory.name, "copy.db"))
+    live_store.flush()
+    copy_store = Written(os.path.join(directory.name, "copy.db"), array.array("Q", live_store.written))
+    copy_store.db.execute("DROP TABLE blobs")
     live_store.db.backup(copy_store.db)
     print("snapshot: %.1f MB in %.2f s (%.0f B an actor); the store copied" % (
         len(blob) / 1e6, taken, len(blob) / options.actors), flush=True)
@@ -278,16 +244,16 @@ def main():
     stand_in = Payments(decline=True)
     copy_clock = tinyactors.SimulatedClock()  # a clock of its own: the copy's time is not the live host's
     started = time.perf_counter()
-    rehearsal = tinyactors.Host.restore(blob, config, wake=copy.wake, log=copy.log, migrated=copy.migrated,
-                                        clock=copy_clock, services={PAYMENT: stand_in.start},
-                                        migration_done=lambda host, result: setattr(copy, "migration_done", result))
+    rehearsal = tinyactors.Host.restore(blob, [], system="orders", config=config, log=copy.log,
+                                        migrated=copy.migrated, clock=copy_clock, services={PAYMENT: stand_in.start},
+                                        migration_done=lambda result: setattr(copy, "migration_done", result),
+                                        store=copy_store, resident=options.resident)
     restored = time.perf_counter() - started
     del blob
     again = rehearsal.snapshot()
     if hashlib.sha256(again).digest() != digest:
         failures.append("the copy's snapshot differs from the one it was restored from")
     del again
-    copy.resident.update((s, None) for s in in_memory)
     rehearsal.run_until_idle()  # the payments in flight, announced again: the stand-in declines them
     if stand_in.started != {s: 1 for s in payers} or stand_in.restored != len(payers):
         failures.append("copy: the stand-in started %d payments (%d restored) for %d payers" % (
@@ -303,35 +269,27 @@ def main():
         rehearsal.add_image(compiled.image)
     copy.migrating = True
     migration = rehearsal.migrate(wake=True)
-    copy_events, stalled, before = 0, 0, -1
+    copy_events, stalled, before, gets = 0, 0, -1, copy_store.gets
     while copy.migration_done is None:
-        stalled = stalled + 1 if copy.moves == before and not copy.asked else 0
+        stalled = stalled + 1 if copy.moves == before else 0
         before = copy.moves
         if stalled > 100:
             failures.append("copy: the migration stalled with %d actors moved" % before)
             break
-        woken = 0
-        while copy.asked and woken < BATCH:
-            session = copy.asked.popleft()
-            copy.queued[index(session)] = 0
-            if session not in copy.resident and not copy.moved[index(session)]:
-                copy.wake_now(rehearsal, session)
-                woken += 1
         if copy_events < options.events:
             n = min(BATCH, options.events - copy_events)
             traffic(copy, rehearsal, sent_copy, n)
             copy_events += n
         rehearsal.run_until_idle()
-        copy.evict(rehearsal)
-        copy.check_resident(rehearsal, 2 * BATCH)
+        copy.check_resident(rehearsal, BATCH)
     copy.migrating = False
     traffic(copy, rehearsal, sent_copy, options.events - copy_events)
-    result = copy.migration_done or {"migration": None, "migrated": 0, "failed": 0, "pending": None}
+    result = copy.migration_done or {"migration": None, "migrated": 0, "failed": [], "pending": None}
     if result["migration"] != migration or result["migrated"] != options.actors or result["failed"] or result["pending"]:
         failures.append("copy: the migration ended %r, not %d migrated" % (result, options.actors))
     rehearsed = time.perf_counter() - started
-    print("rehearse: %d actors to version 2 in %.1f s, %d events meanwhile, %d woken from the copy's store" % (
-        copy.moves, rehearsed, options.events, copy.wakes), flush=True)
+    print("rehearse: %d actors to version 2 in %.1f s, %d events meanwhile, %d loaded from the copy's store" % (
+        copy.moves, rehearsed, options.events, copy_store.gets - gets), flush=True)
     return finish(options, failures, directory, sessions, (sent, sent_live, sent_copy), (live, copy),
                   (host, rehearsal), (real, stand_in), (payers, waiting, live_clock, copy_clock), traffic)
 
@@ -349,7 +307,6 @@ def finish(options, failures, directory, sessions, sent_all, populations, hosts,
         for chunk in range(0, len(sample), BATCH):
             h.send_many([(sessions[i], "report") for i in sample[chunk:chunk + BATCH]])
             h.run_until_idle()
-            population.evict(h)
             population.check_resident(h)
 
     sample = range(options.actors) if options.actors <= options.sample else random.sample(range(options.actors), options.sample)
@@ -357,7 +314,6 @@ def finish(options, failures, directory, sessions, sent_all, populations, hosts,
 
     # 5. the copy: the clock past the delayed sends, then every count, send, payment and version
     copy_clock.increment(10_000)
-    copy.evict(rehearsal)
     copy_region = copy.check_resident(rehearsal)["regionBytes"]
     report(copy, rehearsal, sample)
     expected = {i: (sent[i] + sent_copy[i], 1 if sessions[i] in late else 0, 0 if sessions[i] in paying else -1, 2)
@@ -371,7 +327,6 @@ def finish(options, failures, directory, sessions, sent_all, populations, hosts,
     # 6. the live host goes on: its own events, the clock past its delayed sends; payments still in flight
     traffic(live, host, sent_live, options.events)
     live_clock.increment(10_000)
-    live.evict(host)
     report(live, host, sample)
     expected = {i: (sent[i] + sent_live[i], 1 if sessions[i] in late else 0, -1, 1) for i in sample}
     wrong_live = [i for i in sample if live.reports.get(sessions[i]) != expected[i]]
@@ -388,14 +343,14 @@ def finish(options, failures, directory, sessions, sent_all, populations, hosts,
     host.close()
     live.store.flush()
     foreign = sum(1 for session, blob in live.store.db.execute("SELECT session, blob FROM blobs")
-                  if live.written[index(session)] != zlib.crc32(blob) + 1)
+                  if live.store.written[index(session)] != zlib.crc32(blob) + 1)
     if foreign:
         failures.append("live: %d blobs in the live store are not the live host's last" % foreign)
     peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == "darwin" else 1024)
     print("verify: %d actors on each host, %d wrong on the copy, %d on the live host" % (
         len(sample), len(wrong), len(wrong_live)))
     print("memory: peak resident %.0f MB (%.0f B an actor, both hosts); region %.1f MB live, %.1f MB the copy "
-          "(%.0f B an actor); at most %d actors resident after an eviction" % (
+          "(%.0f B an actor); at most %d actors resident after a turn" % (
               peak_rss / 1e6, peak_rss / options.actors, live_region / 1e6, copy_region / 1e6,
               live_region / options.actors, max(live.peak, copy.peak)))
     for failure in failures[:20]:

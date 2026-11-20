@@ -1,13 +1,16 @@
 <scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="talker" initial="s">
   <state id="s">
     <transition event="call">
-      <send target="tinyactors://b/#_scxml_5" event="hello">
+      <send target="tinyactors://b/#_scxml_5" event="hello" id="h1">
         <content expr="{'n': 41}" />
       </send>
     </transition>
     <transition event="hello">
       <log label="got" expr="f'{_event.origin} {_event.origintype} {_event.data}'" />
       <send targetexpr="_event.origin" event="thanks" />
+    </transition>
+    <transition event="error.communication">
+      <log label="failed" expr="f'{_event.name} {_event.sendid}'" />
     </transition>
   </state>
 </scxml>

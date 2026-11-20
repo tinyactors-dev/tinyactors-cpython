@@ -1,0 +1,16 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" version="1.0" datamodel="python" name="workspace" initial="s">
+  <state id="s">
+    <transition event="make">
+      <send type="spawn" event="spawn" id="s1">
+        <content expr="_event.data" />
+      </send>
+    </transition>
+    <transition event="spawned">
+      <log label="spawned" expr="f'{_event.sendid} {_event.data[&quot;name&quot;]} {_event.data[&quot;address&quot;]}'" />
+      <send targetexpr="str(_event.data['address'])" event="hello" />
+    </transition>
+    <transition event="error.communication">
+      <log label="failed" expr="_event.sendid" />
+    </transition>
+  </state>
+</scxml>

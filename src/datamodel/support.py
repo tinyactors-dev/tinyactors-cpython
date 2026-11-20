@@ -24,13 +24,392 @@ class TinyactorsError(Exception):
     MemoryError is raised instead when the host ran out of a pool its
     config sized."""
 
+    def __new__(cls, message="", code=None, reason=None, path=None, status=None, *rest, **named):
+        if cls is TinyactorsError:  # the subclass of its status, or of a typed method's code
+            cls = _BY_STATUS.get(status) or (None if code is None else _by_code(code)) or cls
+        return super().__new__(cls, message)
+
     def __init__(self, message="", code=None, reason=None, path=None, status=None):
         super().__init__(message)
         self.message = message
         self.code = code
         self.reason = reason
         self.path = path
-        self.status = status
+        self.status = status if status is not None or code is not None else self._status
+
+
+class StaleError(TinyactorsError):
+    """An actor, session, view or handle that does not exist (any more): a
+    send to a session or name that ended, a thin view read after its batch
+    was acknowledged, a typed method's "stale" error. Its status is
+    "TA_ERROR_STALE"."""
+    _status = "TA_ERROR_STALE"
+
+
+class StateError(TinyactorsError):
+    """A call the host cannot make now: a closed host, a snapshot from a
+    handler or with a reply pending, a typed method's "state" error. Its
+    status is "TA_ERROR_STATE"."""
+    _status = "TA_ERROR_STATE"
+
+
+class InvalidError(TinyactorsError):
+    """An argument the host refused: a malformed config, image or address,
+    a typed method's param of the wrong type or out of range. Its status is
+    "TA_ERROR_INVALID"."""
+    _status = "TA_ERROR_INVALID"
+
+
+class UnsupportedError(TinyactorsError):
+    """A value or a feature the host does not take: a value outside the
+    value table, a session that cannot hibernate. Its status is
+    "TA_ERROR_UNSUPPORTED"."""
+    _status = "TA_ERROR_UNSUPPORTED"
+
+
+TinyactorsError._status = None
+_BY_STATUS = {"TA_ERROR_STALE": StaleError, "TA_ERROR_STATE": StateError,
+              "TA_ERROR_INVALID": InvalidError, "TA_ERROR_UNSUPPORTED": UnsupportedError}
+
+
+def _by_code(code):
+    return StaleError if code == -32001 else StateError if code == -32002 else InvalidError
+
+
+def settlers(future):
+    """The handler and on_error of a typed method given no handler: they
+    settle `future`, unless it was cancelled."""
+    def result(value):
+        if not future.done():
+            future.set_result(value)
+
+    def error(exception):
+        if not future.done():
+            future.set_exception(exception)
+    return result, error
+
+
+# ---- the host's construction ----------------------------------------------
+
+# The system id the binding reserves for ask()'s reply addresses: a host
+# may not take it as its own.
+ASK_SYSTEM = "tinyactors-ask"
+
+
+def host_config(system, io_processors, config):
+    """The config ta_host_create gets, and the I/O processors' receive
+    methods by type: `system` as "systemID" (None: none, which core
+    refuses), `config` the rest, and "ioProcessors" made from
+    `io_processors` in its order, each {type, location} with the location
+    the processor's optional `location` attribute."""
+    if config is None:
+        full = {}
+    elif type(config) is not dict:
+        raise TypeError("config is a dict of the host config's system, migrateQuantum and telemetry")
+    else:
+        for key in ("systemID", "ioProcessors"):
+            if key in config:
+                raise TypeError("config has no %r: Host takes it as %s=" % (
+                    key, "system" if key == "systemID" else "io_processors"))
+        full = dict(config)
+    if system == ASK_SYSTEM:
+        raise ValueError("the system id %r is reserved for ask()'s replies" % ASK_SYSTEM)
+    if system is not None:
+        full = dict({"systemID": system}, **full)
+    receivers = {}
+    if io_processors is not None:
+        if type(io_processors) is not dict:
+            raise TypeError("io_processors is a dict of type -> processor")
+        entries = []
+        for kind, processor in io_processors.items():
+            receive = getattr(processor, "receive", None)
+            if isinstance(processor, type) or not callable(receive):
+                raise TypeError("the I/O processor %r is not an object with receive(send)" % (kind,))
+            entry = {"type": kind}
+            location = getattr(processor, "location", None)
+            if location is not None:
+                entry["location"] = location
+            entries.append(entry)
+            receivers[kind] = receive
+        if entries:
+            full["ioProcessors"] = entries
+    return full, receivers
+
+
+# ---- actors ------------------------------------------------------------------
+
+class Actor:
+    """An actor of a host: what Host.spawn and Host.actor return, what
+    send.sender and on_done get. It is a small immutable value made where
+    the API returns one, compared and hashed by its session; keeping one
+    keeps nothing alive in the host, and one whose actor ended refuses
+    what needs the actor (StaleError).
+
+    Use it to talk to the actor: send() an event, ask() a question and
+    await the reply, await state(), context() or get() to inspect it,
+    terminate() it, or await done for its donedata. The awaitable ones
+    need the asyncio driver (async with Host(...))."""
+
+    __slots__ = {
+        "host": "The Host the actor runs in.",
+        "id": "The actor's session id, an int (core's _sessionid).",
+    }
+
+    def __init__(self, host, id):
+        object.__setattr__(self, "host", host)
+        object.__setattr__(self, "id", id)
+
+    def __setattr__(self, name, value):
+        raise AttributeError("an Actor is immutable")
+
+    def __eq__(self, other):
+        if type(other) is not Actor:
+            return NotImplemented
+        return self.id == other.id and self.host is other.host
+
+    def __hash__(self):
+        return hash(self.id)
+
+    def __repr__(self):
+        return "Actor(%d)" % self.id
+
+    @property
+    def address(self):
+        """The actor's address, tinyactors://<system>/#_scxml_<id>, the
+        full form: what another system sends to. A chart sees this actor's
+        sends' _event.origin either in it or as its fragment,
+        #_scxml_<id>, so compare by the fragment."""
+        return _tinyactors.Address.from_session(self.host.system, self.id)
+
+    def send(self, event, data=None, *, sendid=None, traceparent=None):
+        """Give the actor an event (Host.send to its session): applied at
+        the call, run at the host's next turn. `data` becomes _event.data;
+        `traceparent` continues a W3C trace."""
+        self.host.send(self.id, event, data, sendid=sendid, traceparent=traceparent)
+
+    def terminate(self):
+        """End the actor (Host.terminate): it leaves its states, whose
+        <onexit> runs, in the next turn, and sends no done event; a
+        hibernated actor is woken from the host's store to end, and its
+        blob deleted."""
+        self.host.terminate(self.id)
+
+    def state(self):
+        """An awaitable of the actor's active states (the typed method
+        actor_state): {"configuration": [...], ...} as core answers it."""
+        return self.host.actor_state(session=self.id)
+
+    def context(self):
+        """An awaitable of the actor's datamodel variables (the typed
+        method actor_context), as values of the value table."""
+        return self.host.actor_context(session=self.id)
+
+    def get(self):
+        """An awaitable of what the host knows about the actor (the typed
+        method actor_get): its chart, its state, its mailbox and timers."""
+        return self.host.actor_get(session=self.id)
+
+    def ask(self, event, data=None):
+        """Send the actor `event` with `data` and return an awaitable of its
+        reply, an (event, data) pair: the chart answers with <send
+        targetexpr="_event.origin" event="..."/>. The event's origin is an
+        address of the host's own (system tinyactors-ask), so the reply
+        comes back here and never reaches your transport. There is no
+        timeout of its own: use asyncio.wait_for, whose cancel drops the
+        ask; asks pending when the host closes never complete. Needs the
+        asyncio driver (TypeError under `with`)."""
+        return self.host._ask(self.id, event, data)
+
+    @property
+    def done(self):
+        """An awaitable of the actor's donedata, settled when it reaches a
+        top-level final state (or raising the error it ended with). Await
+        it under asyncio; an actor that ended already raises StaleError."""
+        return self.host._done(self.id)
+
+
+# ---- a directory of charts ----------------------------------------------------
+
+def compile_dir(path, *, resolver=None):
+    """Compile every *.scxml file under the directory `path` into one image,
+    and return the Compiled, as compile_charts does.
+
+    Keep an application's charts and their helper files (a .py file a
+    chart reads with <script src>, a chart it invokes with <invoke src>)
+    in one directory, compile it once at startup or in a build step, and
+    give the result to any number of hosts. The charts are named by their
+    path under `path` (sorted; the first is the image's default boot
+    chart), and a src is read from under `path`, relative to the document
+    that names it: a path that leaves `path`, symbolic links included, is
+    refused (ResolveError, so CompileError). Give `resolver` to read the
+    src files yourself instead. A chart file whose real path leaves `path`
+    raises ValueError; an error in a chart raises CompileError."""
+    import pathlib
+    root = pathlib.Path(path).resolve(strict=True)
+    if not root.is_dir():
+        raise NotADirectoryError("compile_dir takes a directory: %s" % path)
+    sources = []
+    for file in sorted(root.rglob("*.scxml")):
+        if not file.is_file():
+            continue
+        if not file.resolve().is_relative_to(root):
+            raise ValueError("the chart %s leaves %s" % (file, root))
+        sources.append((file.relative_to(root).as_posix(), file.read_text(encoding="utf-8")))
+    if not sources:
+        raise ValueError("no *.scxml file under %s" % root)
+    return _tinyactors.compile_charts(sources, resolver if resolver is not None else _Directory(root))
+
+
+class _Directory:
+    """compile_dir's resolver: `source` read under `root`, relative to the
+    document `base` that names it, refused when it leaves `root`."""
+
+    def __init__(self, root):
+        self.root = root
+
+    def __call__(self, base, source):
+        import pathlib
+        target = (self.root / pathlib.PurePosixPath(base).parent / source).resolve()
+        if not target.is_relative_to(self.root):
+            raise ResolveError("%s leaves the charts' directory" % source)
+        try:
+            return target.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            raise ResolveError("no file %s under the charts' directory" % source) from None
+        except (IsADirectoryError, UnicodeDecodeError) as error:
+            raise ResolveError("%s cannot be read: %s" % (source, error)) from None
+
+
+# ---- stores: where hibernated actors' blobs go ---------------------------------
+
+class MemoryStore:
+    """A store of hibernated actors' blobs in a dict: Host(store=...)
+    saves an actor's blob here when it hibernates the actor, loads it when
+    an event comes for it, and deletes it once the actor is back or ended.
+
+    Use it in tests, and where the host's memory, not the process's, is
+    what must stay small: the blobs are bytes in this process. For blobs
+    that leave memory use SQLiteStore, or your own object with the same
+    three methods."""
+
+    __slots__ = {"blobs": "The blobs by session, a dict: what a test reads to see what was stored."}
+
+    def __init__(self):
+        self.blobs = {}
+
+    def save(self, session, blob):
+        """Keep `blob`, the hibernated actor `session`'s bytes, replacing an
+        earlier one."""
+        self.blobs[session] = blob
+
+    def load(self, session):
+        """The blob saved for `session`; KeyError when there is none (the
+        host reports it, and the actor stays hibernated)."""
+        return self.blobs[session]
+
+    def delete(self, session):
+        """Forget `session`'s blob: the actor was woken, or it ended. One
+        that is not there is nothing to do."""
+        self.blobs.pop(session, None)
+
+
+class SQLiteStore:
+    """A store of hibernated actors' blobs in an SQLite database file, one
+    row per actor in the table tinyactors_blobs (session, blob): what
+    Host(store=..., resident=N) uses to keep at most N actors in memory
+    and the rest on disk.
+
+    `path` is the database file (":memory:" for none). It is a cache of
+    the host's actors, not their durability: a host's blobs wake only in
+    that host or a host restored from its snapshot, so keep the file with
+    the snapshot when you keep one. Call close() when the host is closed."""
+
+    __slots__ = {"connection": "The sqlite3 connection, for an application that reads the table itself."}
+
+    def __init__(self, path):
+        import sqlite3
+        self.connection = sqlite3.connect(path, isolation_level=None)
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute("PRAGMA synchronous=NORMAL")
+        self.connection.execute("CREATE TABLE IF NOT EXISTS tinyactors_blobs "
+                                "(session INTEGER PRIMARY KEY, blob BLOB NOT NULL)")
+
+    def save(self, session, blob):
+        """Keep `blob`, the hibernated actor `session`'s bytes, replacing an
+        earlier one (one row per session)."""
+        self.connection.execute("INSERT OR REPLACE INTO tinyactors_blobs VALUES (?, ?)", (_signed(session), blob))
+
+    def load(self, session):
+        """The blob saved for `session`; KeyError when there is none (the
+        host reports it, and the actor stays hibernated)."""
+        row = self.connection.execute("SELECT blob FROM tinyactors_blobs WHERE session = ?",
+                                      (_signed(session),)).fetchone()
+        if row is None:
+            raise KeyError(session)
+        return row[0]
+
+    def delete(self, session):
+        """Forget `session`'s blob: the actor was woken, or it ended. One
+        that is not there is nothing to do."""
+        self.connection.execute("DELETE FROM tinyactors_blobs WHERE session = ?", (_signed(session),))
+
+    def close(self):
+        """Close the database connection; the file keeps the blobs saved."""
+        self.connection.close()
+
+
+def _signed(session):
+    """A session id (to 2^64 - 1) as SQLite's signed 64-bit integer."""
+    return session - (1 << 64) if session >= 1 << 63 else session
+
+
+class Spawner:
+    """An I/O processor that spawns actors for charts: give it to the host
+    under a type you name, io_processors={"spawn": tinyactors.Spawner()},
+    and a chart spawns with <send type="spawn" event="spawn"> whose data is
+    {"chart": name, "name": name or None, "params": dict or None}.
+
+    The new actor runs the chart's current version (Host.spawn) under the
+    name. The sender gets `spawned` with {"name", "address"} (the new
+    actor's session address) and the send's sendid, so a <send id> matches
+    its answer; an unknown chart, data of another shape or a spawn the host
+    refuses gives the sender error.communication instead. A type no
+    processor serves stays error.execution, as SCXML has it.
+
+    It spawns; it does not look names up. A name has one owner, the
+    collection actor that decides which actors of a kind exist, and that
+    actor records the spawns it asked for, so it never asks twice for a
+    name. Spawning under a name an older version's actor holds, after
+    add_image of a new version, is how an application updates."""
+
+    __slots__ = ()
+
+    def receive(self, send):
+        """Spawn what send.data asks for and answer `spawned`, or fail the
+        send (error.communication) when the host cannot."""
+        data = send.data
+        try:
+            if type(data) is not dict or type(data.get("chart")) is not str:
+                raise TypeError("a Spawner's data is {chart, name, params}")
+            actor = send.host.spawn(data["chart"], name=data.get("name"), params=data.get("params"))
+        except (TinyactorsError, TypeError, ValueError, MemoryError):
+            send.fail()
+            return
+        send.answer("spawned", {"name": data.get("name"), "address": actor.address})
+
+
+async def actors(host, chart):
+    """Every live actor of the host (actor.list, a page at a time), or
+    those of the chart named `chart`."""
+    found, cursor = [], 0
+    while True:
+        page = await host.actor_list(cursor=cursor, limit=512)
+        for session in page["sessions"]:
+            if chart is None or host._chart_of(session) == chart:
+                found.append(Actor(host, session))
+        cursor = page["cursor"]
+        if cursor is None:
+            return found
 
 
 class CompileError(TinyactorsError):
@@ -102,7 +481,7 @@ class Diagnostic:
         return "%s:%d:%d: %s: %s" % (self.file, self.line, self.column, self.severity, self.message)
 
 
-for _type in (TinyactorsError, CompileError, ResolveError, Diagnostic):
+for _type in (TinyactorsError, CompileError, ResolveError, Diagnostic, Actor, MemoryStore, SQLiteStore, Spawner, compile_dir):
     _type.__module__ = "tinyactors"
 
 # ---- the rewrite ---------------------------------------------------------
@@ -327,7 +706,8 @@ def _function(body, parameters, namespace, file):
     return local["_ta_f"]
 
 
-CONDITION, VALUE_KIND, LOCATION, SCRIPT, STRING, CONTENT, ITEM = 1, 2, 3, 4, 5, 6, 7
+CONDITION, VALUE_KIND, LOCATION, SCRIPT, STRING, CONTENT, ITEM, GLOBAL_SCRIPT = 1, 2, 3, 4, 5, 6, 7, 8
+SCRIPTS = (SCRIPT, GLOBAL_SCRIPT)  # in executable content, and the chart's top-level ones: the same here
 
 
 def _names_bound(target, names):
@@ -370,7 +750,7 @@ def attach(name, data, expressions, namespace, file):
     methods = {}
     scripts = []
     for index, (kind, source, line) in enumerate(expressions):
-        if kind == SCRIPT:
+        if kind in SCRIPTS:
             try:
                 tree = _parse(source, "exec", file, line)
             except SyntaxError:
@@ -402,10 +782,10 @@ def attach(name, data, expressions, namespace, file):
     functions = []
     script_trees = dict(scripts)
     for index, (kind, source, line) in enumerate(expressions):
-        rewrite = Rewrite(names, file, 1 if kind == SCRIPT else line)
+        rewrite = Rewrite(names, file, 1 if kind in SCRIPTS else line)
         rewrite.methods = set(methods)
         try:
-            if kind == SCRIPT:
+            if kind in SCRIPTS:
                 tree = script_trees.get(index) or _parse(source, "exec", file, line)
                 body = [rewrite.statement(node, set(), False) for node in tree.body
                         if not isinstance(node, ast.FunctionDef)]

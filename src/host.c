@@ -146,6 +146,18 @@ void ta_python_host_keep_error(ta_python_host *host) {
     else Py_XDECREF(error);
 }
 
+void ta_python_handler_failed(ta_python_host *host, PyObject *effect) {
+    if (!host->on_handler_error || host->on_handler_error == Py_None || !PyErr_ExceptionMatches(PyExc_Exception)) {
+        ta_python_host_keep_error(host); /* a KeyboardInterrupt, SystemExit: raised after the turn */
+        return;
+    }
+    PyObject *error = PyErr_GetRaisedException();
+    PyObject *done = PyObject_CallFunctionObjArgs(host->on_handler_error, error, effect ? effect : Py_None, NULL);
+    if (!done) ta_python_host_keep_error(host); /* the hook's own exception */
+    Py_XDECREF(done);
+    Py_DECREF(error);
+}
+
 /* ---- payloads: a value for a session's datamodel ----------------------------------- */
 
 static uint32_t ta_python_datamodel_index(ta_string_view name) {
@@ -428,15 +440,159 @@ static ta_status ta_python_host_restore_core(ta_python_host *host, ta_python_res
     return ok ? TA_OK : TA_ERROR_INVALID;
 }
 
-static PyObject *ta_python_host_build(PyTypeObject *type, const ta_python_build *build) {
-    static char *const names[] = {"config", "io_processors", "log", "clock", "telemetry", "wake", "migrated",
-                                  "services", "migration_done", NULL};
-    PyObject *config, *handlers = Py_None, *log = Py_None, *clock = Py_None, *telemetry = Py_None;
-    PyObject *wake = Py_None, *migrated = Py_None, *services = Py_None, *migration_done = Py_None;
-    if (!PyArg_ParseTupleAndKeywords(build->arguments, build->keywords, build->pack ? "O|O$OOOOOOO:restore" : "O|O$OOOOOOO:Host",
-                                     names, &config, &handlers, &log, &clock, &telemetry, &wake, &migrated, &services,
-                                     &migration_done))
+/* 64 random bits: os.urandom(8), the operating system's random source,
+ * for the host's identity (ta_host_environment.nonce, so its hibernation
+ * blobs wake in no other host) and the trace seed. -1 with the exception
+ * set when it fails. */
+static int ta_python_random(uint64_t *bits) {
+    PyObject *os = PyImport_ImportModule("os");
+    PyObject *drawn = os ? PyObject_CallMethod(os, "urandom", "i", (int)sizeof *bits) : NULL;
+    Py_XDECREF(os);
+    if (!drawn) return -1;
+    int ok = PyBytes_Check(drawn) && PyBytes_Size(drawn) == (Py_ssize_t)sizeof *bits;
+    if (ok) memcpy(bits, PyBytes_AsString(drawn), sizeof *bits);
+    else PyErr_SetString(PyExc_SystemError, "os.urandom gave no 8 bytes");
+    Py_DECREF(drawn);
+    return ok ? 0 : -1;
+}
+
+/* The config ta_host_create gets, a new reference: the caller's, or, when
+ * its "system" gives no "traceSeed", a copy with a random one (the language
+ * layer picks the seed, the maintainer, 2026-11-18), so hosts start
+ * different trace ids; a seed the caller sets is kept, and so reproduces.
+ * A config core will refuse anyway (not a dict, a "system" that is not one)
+ * is kept as it is. NULL with the exception set. */
+static PyObject *ta_python_config_seeded(PyObject *config) {
+    if (!PyDict_CheckExact(config)) return Py_NewRef(config);
+    PyObject *system = NULL;
+    int has = PyDict_GetItemStringRef(config, "system", &system);
+    if (has < 0) return NULL;
+    if (has && !PyDict_CheckExact(system)) {
+        Py_DECREF(system);
+        return Py_NewRef(config);
+    }
+    PyObject *given = NULL;
+    int seeded = has ? PyDict_GetItemStringRef(system, "traceSeed", &given) : 0;
+    Py_XDECREF(given);
+    if (seeded != 0) { /* the caller's, or an error */
+        Py_XDECREF(system);
+        return seeded < 0 ? NULL : Py_NewRef(config);
+    }
+    uint64_t bits = 0;
+    PyObject *copy = ta_python_random(&bits) < 0 ? NULL : PyDict_Copy(config);
+    PyObject *system_copy = !copy ? NULL : has ? PyDict_Copy(system) : PyDict_New();
+    PyObject *seed = system_copy ? PyLong_FromUnsignedLongLong(bits) : NULL;
+    int ok = seed && PyDict_SetItemString(system_copy, "traceSeed", seed) == 0 &&
+             PyDict_SetItemString(copy, "system", system_copy) == 0;
+    Py_XDECREF(seed);
+    Py_XDECREF(system_copy);
+    Py_XDECREF(system);
+    if (!ok) Py_CLEAR(copy);
+    return copy;
+}
+
+/* An image of `charts` (a Compiled, or any buffer) as a buffer view: 0, or -1. */
+static int ta_python_chart_image(ta_python_host *host, PyObject *chart, Py_buffer *view) {
+    int compiled = Py_IS_TYPE(chart, (PyTypeObject *)host->state->compiled_type);
+    PyObject *image = compiled ? PyObject_GetAttrString(chart, "image") : Py_NewRef(chart);
+    if (!image) return -1;
+    int status = PyObject_GetBuffer(image, view, PyBUF_SIMPLE);
+    Py_DECREF(image);
+    if (status < 0 && PyErr_ExceptionMatches(PyExc_TypeError)) {
+        PyErr_Clear();
+        PyErr_SetString(PyExc_TypeError, "charts is a Compiled, an image's bytes, or a list of them");
+    }
+    return status;
+}
+
+/* The pack holds an image of these bytes already (a restore keeps its own). */
+static int ta_python_pack_has(const ta_bytes *pack, ta_bytes image) {
+    ta_host_snapshot_contents contents;
+    memset(&contents, 0, sizeof contents);
+    contents.size = sizeof contents;
+    if (!pack || ta_host_snapshot_unpack(*pack, &contents) != TA_OK) return 0;
+    for (uint32_t i = 0; i < contents.image_count; i++) {
+        ta_bytes held = ta_host_snapshot_image(*pack, i);
+        if (held.length == image.length && !memcmp(held.pointer, image.pointer, image.length)) return 1;
+    }
+    return 0;
+}
+
+/* Host(charts, ...): each image added in order, a segment each
+ * (ta_host_add_image copies it); a restore adds those its snapshot does
+ * not hold already (a new version). 0, or -1 with an exception. */
+static int ta_python_host_add_charts(ta_python_host *host, PyObject *charts, const ta_bytes *pack) {
+    PyObject *list = PyList_Check(charts) || PyTuple_Check(charts) ? PySequence_List(charts) : PyList_New(0);
+    if (list && !PyList_Check(charts) && !PyTuple_Check(charts) && PyList_Append(list, charts) < 0) Py_CLEAR(list);
+    if (!list) return -1;
+    int status = 0;
+    for (Py_ssize_t i = 0; status == 0 && i < PyList_Size(list); i++) {
+        Py_buffer view;
+        if (ta_python_chart_image(host, PyList_GetItem(list, i), &view) < 0) {
+            status = -1;
+            break;
+        }
+        ta_bytes image = {view.buf, (size_t)view.len};
+        uint32_t segment = 0;
+        ta_status added = ta_python_pack_has(pack, image) ? TA_OK : ta_host_add_image(host->host, image, &segment);
+        PyBuffer_Release(&view);
+        if (added != TA_OK) {
+            ta_python_raise_status(host->state, added);
+            status = -1;
+        }
+    }
+    Py_DECREF(list);
+    return status;
+}
+
+/* Host(...)'s arguments, parsed: the config and the I/O processors' receive
+ * methods come from support.host_config. */
+typedef struct ta_python_options {
+    PyObject *charts, *config, *handlers, *log, *clock, *telemetry, *store, *resident, *migrated, *services, *migration_done,
+        *transport, *on_done, *on_error, *on_handler_error;
+    const ta_bytes *pack; /* NULL: Host(...); Host.restore: the snapshot's pack */
+} ta_python_options;
+
+static PyObject *ta_python_host_build(PyTypeObject *type, const ta_python_options *options);
+
+static PyObject *ta_python_host_parse(PyTypeObject *type, const ta_python_build *build) {
+    static char *const names[] = {"charts", "system", "io_processors", "config", "clock", "log", "telemetry",
+                                  "services", "transport", "on_done", "on_error", "on_handler_error", "migrated",
+                                  "migration_done", "store", "resident", NULL};
+    PyObject *system = NULL, *processors = Py_None, *given = Py_None;
+    ta_python_options options = {NULL, NULL, NULL, Py_None, Py_None, Py_None, Py_None, Py_None, Py_None, Py_None,
+                                 Py_None, Py_None, Py_None, Py_None, Py_None, build->pack};
+    if (!PyArg_ParseTupleAndKeywords(build->arguments, build->keywords,
+                                     build->pack ? "O|$OOOOOOOOOOOOOOO:restore" : "O|$OOOOOOOOOOOOOOO:Host", names,
+                                     &options.charts, &system, &processors, &given, &options.clock, &options.log,
+                                     &options.telemetry, &options.services, &options.transport, &options.on_done,
+                                     &options.on_error, &options.on_handler_error, &options.migrated,
+                                     &options.migration_done, &options.store, &options.resident))
         return NULL;
+    if (!system) {
+        PyErr_SetString(PyExc_TypeError, build->pack ? "restore() needs system=, the system id"
+                                                     : "Host() needs system=, the system id");
+        return NULL;
+    }
+    ta_python_module_state *state = ta_python_state_of_type(type);
+    PyObject *made = state ? PyObject_CallFunctionObjArgs(state->host_config, system, processors, given, NULL) : NULL;
+    if (!made) return NULL;
+    PyObject *host = NULL;
+    if (PyTuple_Check(made) && PyTuple_Size(made) == 2) {
+        options.config = PyTuple_GetItem(made, 0);
+        options.handlers = PyTuple_GetItem(made, 1);
+        host = ta_python_host_build(type, &options);
+    } else PyErr_SetString(PyExc_SystemError, "host_config gave no (config, handlers)");
+    Py_DECREF(made);
+    return host;
+}
+
+/* Host(...) from its parsed options. */
+static PyObject *ta_python_host_build(PyTypeObject *type, const ta_python_options *options) {
+    PyObject *config = options->config, *handlers = options->handlers, *log = options->log, *clock = options->clock;
+    PyObject *telemetry = options->telemetry, *migrated = options->migrated;
+    PyObject *services = options->services, *migration_done = options->migration_done, *transport = options->transport;
+    const ta_python_build *build = &(ta_python_build){NULL, NULL, options->pack};
     ta_time restored_time = 0;
     ta_string_view restored_id = {NULL, 0};
     ta_python_module_state *state = ta_python_state_of_type(type);
@@ -461,17 +617,41 @@ static PyObject *ta_python_host_build(PyTypeObject *type, const ta_python_build 
     host->deadline = UINT64_MAX;
     host->log = Py_NewRef(log);
     host->telemetry = Py_NewRef(telemetry);
-    host->wake = Py_NewRef(wake);
+    host->store = Py_NewRef(options->store);
     host->migrated = Py_NewRef(migrated);
     host->migration_done = Py_NewRef(migration_done);
+    host->on_done = Py_NewRef(options->on_done);
+    host->on_error = Py_NewRef(options->on_error);
+    host->on_handler_error = Py_NewRef(options->on_handler_error);
+    host->done = PyDict_New();
+    host->asked = PyDict_New();
+    host->system_id = Py_NewRef(Py_None);
     host->services = services == Py_None ? PyDict_New() : PyDict_Copy(services);
     host->invocations = PyDict_New();
-    if (wake != Py_None) {
-        PyObject *answer = PyObject_CallFunctionObjArgs(state->coroutine_function, wake, NULL);
-        host->wake_async = answer ? PyObject_IsTrue(answer) : -1;
-        Py_XDECREF(answer);
-        if (host->wake_async < 0) goto fail;
-        if (host->wake_async) host->has_async = 1;
+    if (options->resident != Py_None) {
+        host->resident = PyLong_Check(options->resident) ? PyLong_AsUnsignedLongLong(options->resident) : 0;
+        if (PyErr_Occurred() || !host->resident) {
+            PyErr_Clear();
+            PyErr_SetString(PyExc_ValueError, "resident is the most actors kept in memory, an int from 1");
+            goto fail;
+        }
+        if (options->store == Py_None) {
+            PyErr_SetString(PyExc_TypeError, "resident needs a store= to hibernate the other actors into");
+            goto fail;
+        }
+    }
+    if (options->store != Py_None) {
+        static const char *const methods[] = {"save", "load", "delete"};
+        for (int i = 0; i < 3; i++) {
+            PyObject *method = PyObject_GetAttrString(options->store, methods[i]);
+            int callable = method && PyCallable_Check(method);
+            Py_XDECREF(method);
+            if (!callable) {
+                PyErr_Clear();
+                PyErr_Format(PyExc_TypeError, "store is an object with save(session, blob), load(session) and delete(session): it has no %s", methods[i]);
+                goto fail;
+            }
+        }
     }
     if (telemetry != Py_None) {
         PyObject *answer = PyObject_CallFunctionObjArgs(state->coroutine_function, telemetry, NULL);
@@ -480,6 +660,16 @@ static PyObject *ta_python_host_build(PyTypeObject *type, const ta_python_build 
         if (host->telemetry_async < 0) goto fail;
         if (host->telemetry_async) host->has_async = 1;
     }
+    int transport_async = 0; /* the transport: a row as an I/O processor's, with no type */
+    if (transport != Py_None) {
+        PyObject *answer = PyObject_CallFunctionObjArgs(state->coroutine_function, transport, NULL);
+        transport_async = answer ? PyObject_IsTrue(answer) : -1;
+        Py_XDECREF(answer);
+        if (transport_async < 0) goto fail;
+        if (transport_async) host->has_async = 1;
+    }
+    host->transport = Py_BuildValue("(OOO)", Py_None, transport, transport_async ? Py_True : Py_False);
+    if (!host->transport) goto fail;
     host->clock = Py_NewRef(clock);
     host->loop = Py_NewRef(Py_None);
     host->timer = Py_NewRef(Py_None);
@@ -491,7 +681,9 @@ static PyObject *ta_python_host_build(PyTypeObject *type, const ta_python_build 
     host->arena_allocator = ta_growable_arena_allocator(&host->arena);
     ta_table_config pending = {sizeof pending, sizeof(ta_python_pending_row), &host->allocator};
     ta_table_init(&host->pending, &pending);
-    if (!host->waiters || !host->ending_tasks || !host->services || !host->invocations ||
+    ta_table_config asks = {sizeof asks, sizeof(ta_python_ask_row), &host->allocator};
+    ta_table_init(&host->asks, &asks);
+    if (!host->waiters || !host->ending_tasks || !host->done || !host->asked || !host->services || !host->invocations ||
         ta_python_datamodel_init(&host->python, host) < 0) goto fail;
     ta_datamodel_ecmascript_config ecmascript;
     memset(&ecmascript, 0, sizeof ecmascript);
@@ -506,10 +698,19 @@ static PyObject *ta_python_host_build(PyTypeObject *type, const ta_python_build 
 
     ta_bytes cbor;
     ta_growable_arena_mark mark = ta_growable_arena_position(&host->arena);
-    if (ta_python_host_cbor(host, config, &cbor) < 0) goto fail;
+    /* a restore keeps its config as given: its segments keep the snapshot's generators */
+    PyObject *given = build->pack ? Py_NewRef(config) : ta_python_config_seeded(config);
+    int written = given ? ta_python_host_cbor(host, given, &cbor) : -1;
+    Py_XDECREF(given);
+    if (written < 0) goto fail;
     ta_buffer refusal = {ta_growable_arena_alloc(&host->arena, 8192, 8), 8192, 0};
     ta_host_environment environment = {sizeof environment, TA_PYTHON_DATAMODELS, host->datamodels,
-                                       host->allocator, NULL, refusal.pointer ? &refusal : NULL};
+                                       host->allocator, NULL, refusal.pointer ? &refusal : NULL, 0};
+    /* a restore keeps the snapshot's identity: ta_host_restore ignores the nonce */
+    if (!build->pack && ta_python_random(&environment.nonce) < 0) {
+        ta_growable_arena_release(&host->arena, mark);
+        goto fail;
+    }
     ta_status status;
     if (build->pack) {
         ta_python_restoring restoring = {*build->pack, &environment, cbor, 0, {NULL, 0}};
@@ -541,16 +742,15 @@ static PyObject *ta_python_host_build(PyTypeObject *type, const ta_python_build 
     ta_growable_arena_release(&host->arena, mark);
     if (!effective) goto fail;
     int same_system = 1; /* a restore: the effective config's system id is the snapshot's */
+    PyObject *id = NULL;
+    if (PyDict_GetItemStringRef(effective, "systemID", &id) > 0 && PyUnicode_Check(id)) ta_python_replace(&host->system_id, Py_NewRef(id));
     if (build->pack) {
-        PyObject *id = NULL;
         Py_ssize_t length = 0;
-        const char *text = PyDict_GetItemStringRef(effective, "systemID", &id) > 0 && PyUnicode_Check(id)
-                               ? PyUnicode_AsUTF8AndSize(id, &length)
-                               : NULL;
+        const char *text = id && PyUnicode_Check(id) ? PyUnicode_AsUTF8AndSize(id, &length) : NULL;
         same_system = text && (size_t)length == restored_id.length && memcmp(text, restored_id.pointer, restored_id.length) == 0;
-        Py_XDECREF(id);
-        PyErr_Clear();
     }
+    Py_XDECREF(id);
+    PyErr_Clear();
     PyObject *system = NULL, *rate = NULL;
     if (PyDict_GetItemStringRef(effective, "system", &system) > 0 && PyDict_Check(system))
         PyDict_GetItemStringRef(system, "ticksPerSecond", &rate);
@@ -561,8 +761,7 @@ static PyObject *ta_python_host_build(PyTypeObject *type, const ta_python_build 
     Py_XDECREF(system);
     Py_XDECREF(rate);
     int processors = PyErr_Occurred() || !host->ticks_per_second ? -1
-                                                                  : ta_python_host_processors(host, effective,
-                                                                                              handlers == Py_None ? NULL : handlers);
+                                                                  : ta_python_host_processors(host, effective, handlers);
     Py_DECREF(effective);
     if (processors < 0) {
         if (!PyErr_Occurred()) ta_python_raise_status(state, TA_ERROR_STATE);
@@ -580,6 +779,7 @@ static PyObject *ta_python_host_build(PyTypeObject *type, const ta_python_build 
         ta_python_clock_resume(host, restored_time); /* on from the snapshot's time */
     }
     ta_python_advance(host); /* the host's clock starts now, not at 0 */
+    if (ta_python_host_add_charts(host, options->charts, options->pack) < 0) goto fail;
     return (PyObject *)host;
 fail:
     Py_DECREF(host);
@@ -633,7 +833,11 @@ static void ta_python_host_free(ta_python_host *host) {
     host->host = NULL;
     ta_python_pending_drop(host);
     ta_table_free(&host->pending);
+    ta_python_asks_drop(host);
+    ta_table_free(&host->asks);
     if (host->invocations) PyDict_Clear(host->invocations); /* the services are dropped, not stopped */
+    if (host->done) PyDict_Clear(host->done);               /* Actor.done never settles */
+    if (host->asked) PyDict_Clear(host->asked);
     ta_python_datamodel_free(&host->python);
     if (host->ecmascript) ta_datamodel_ecmascript_free(host->ecmascript); /* after the host that used it */
     host->ecmascript = NULL;
@@ -671,11 +875,18 @@ static int ta_python_host_traverse(PyObject *self, visitproc visit, void *arg) {
     ta_python_host *host = (ta_python_host *)self;
     Py_VISIT(Py_TYPE(self));
     Py_VISIT(host->processors);
+    Py_VISIT(host->transport);
     Py_VISIT(host->log);
     Py_VISIT(host->telemetry);
-    Py_VISIT(host->wake);
+    Py_VISIT(host->store);
     Py_VISIT(host->migrated);
     Py_VISIT(host->migration_done);
+    Py_VISIT(host->on_done);
+    Py_VISIT(host->on_error);
+    Py_VISIT(host->on_handler_error);
+    Py_VISIT(host->done);
+    Py_VISIT(host->asked);
+    Py_VISIT(host->system_id);
     Py_VISIT(host->services);
     Py_VISIT(host->invocations);
     Py_VISIT(host->clock);
@@ -691,6 +902,10 @@ static int ta_python_host_traverse(PyObject *self, visitproc visit, void *arg) {
         Py_VISIT(row->handler);
         Py_VISIT(row->on_error);
     }
+    for (uint32_t slot = 0; slot < host->asks.capacity; slot++) {
+        ta_python_ask_row *row = ta_table_at(&host->asks, slot);
+        if (row) Py_VISIT(row->future);
+    }
     return ta_python_datamodel_traverse(&host->python, visit, arg);
 }
 
@@ -701,11 +916,18 @@ static int ta_python_host_clear(PyObject *self) {
     ta_python_host *host = (ta_python_host *)self;
     if (host->host && host->depth == 0 && !host->turning) ta_python_host_close(host, 1);
     Py_CLEAR(host->processors);
+    Py_CLEAR(host->transport);
     Py_CLEAR(host->log);
     Py_CLEAR(host->telemetry);
-    Py_CLEAR(host->wake);
+    Py_CLEAR(host->store);
     Py_CLEAR(host->migrated);
     Py_CLEAR(host->migration_done);
+    Py_CLEAR(host->on_done);
+    Py_CLEAR(host->on_error);
+    Py_CLEAR(host->on_handler_error);
+    Py_CLEAR(host->done);
+    Py_CLEAR(host->asked);
+    Py_CLEAR(host->system_id);
     Py_CLEAR(host->services);
     Py_CLEAR(host->invocations);
     Py_CLEAR(host->clock);
@@ -780,41 +1002,38 @@ static PyObject *ta_python_host_chart(PyObject *self, PyObject *name) {
     return result;
 }
 
-/* actor_by_name(name) -> session or None: ta_host_actor_by_name, the live
- * actor spawned with `name` (boot actors carry their manifest name), newest
- * segment first. */
-static PyObject *ta_python_host_actor_by_name(PyObject *self, PyObject *name) {
-    ta_python_host *host = (ta_python_host *)self;
-    ta_python_call call;
-    if (ta_python_enter(host, &call) < 0) return NULL;
-    PyObject *result = NULL;
-    ta_string_view text;
-    if (PyUnicode_Check(name) && ta_python_text(name, &text) == 0) {
-        uint64_t session = ta_host_actor_by_name(host->host, text);
-        result = session ? PyLong_FromUnsignedLongLong(session) : Py_NewRef(Py_None);
-    } else if (!PyErr_Occurred()) PyErr_SetString(PyExc_TypeError, "actor_by_name takes the actor's name, a str");
-    ta_python_leave(&call);
-    return result;
-}
-
-static int ta_python_session(PyObject *value, uint64_t *out) {
+int ta_python_session(ta_python_host *host, PyObject *value, uint64_t *out) {
+    if (Py_IS_TYPE(value, (PyTypeObject *)host->state->actor_type)) { /* an Actor: its id */
+        PyObject *id = PyObject_GetAttrString(value, "id");
+        int status = id ? ta_python_session(host, id, out) : -1;
+        Py_XDECREF(id);
+        return status;
+    }
     *out = PyLong_Check(value) ? PyLong_AsUnsignedLongLong(value) : 0;
     if (PyErr_Occurred()) return -1;
     if (!PyLong_Check(value)) {
-        PyErr_SetString(PyExc_TypeError, "a session is an int");
+        PyErr_SetString(PyExc_TypeError, "a session is an int or an Actor");
         return -1;
     }
     return 0;
 }
 
+PyObject *ta_python_actor_new(ta_python_host *host, uint64_t session) {
+    PyObject *id = PyLong_FromUnsignedLongLong(session);
+    PyObject *actor = id ? PyObject_CallFunctionObjArgs(host->state->actor_type, (PyObject *)host, id, NULL) : NULL;
+    Py_XDECREF(id);
+    return actor;
+}
+
 static PyObject *ta_python_host_spawn(PyObject *self, PyObject *arguments, PyObject *keywords) {
-    static char *const names[] = {"ref", "name", "params", "traceparent", NULL};
+    static char *const names[] = {"chart", "name", "params", "traceparent", NULL};
     ta_python_host *host = (ta_python_host *)self;
     PyObject *ref, *name = Py_None, *params = Py_None, *traceparent = Py_None;
     if (!PyArg_ParseTupleAndKeywords(arguments, keywords, "O|OOO:spawn", names, &ref, &name, &params, &traceparent))
         return NULL;
-    if (!Py_IS_TYPE(ref, (PyTypeObject *)host->state->chart_type)) {
-        PyErr_SetString(PyExc_TypeError, "spawn takes a ChartRef from Host.chart");
+    int by_name = PyUnicode_Check(ref);
+    if (!by_name && !Py_IS_TYPE(ref, (PyTypeObject *)host->state->chart_type)) {
+        PyErr_SetString(PyExc_TypeError, "spawn takes a chart's name (str) or a ChartRef from Host.chart");
         return NULL;
     }
     ta_python_call call;
@@ -822,8 +1041,18 @@ static PyObject *ta_python_host_spawn(PyObject *self, PyObject *arguments, PyObj
     PyObject *result = NULL;
     ta_spawn spawn;
     memset(&spawn, 0, sizeof spawn);
-    spawn.segment = ((ta_python_chart_ref *)ref)->segment;
-    spawn.chart = ((ta_python_chart_ref *)ref)->chart;
+    ta_host_chart_ref chart = {0, 0};
+    ta_string_view chart_name;
+    ta_status found = TA_OK; /* a name: the current version of the chart (ta_host_chart) */
+    if (by_name) found = ta_python_text(ref, &chart_name) < 0 ? TA_ERROR_INVALID : ta_host_chart(host->host, chart_name, &chart);
+    else chart = (ta_host_chart_ref){((ta_python_chart_ref *)ref)->segment, ((ta_python_chart_ref *)ref)->chart};
+    if (found != TA_OK) {
+        if (!PyErr_Occurred()) ta_python_raise_status(host->state, found);
+        ta_python_leave(&call);
+        return NULL;
+    }
+    spawn.segment = chart.segment;
+    spawn.chart = chart.chart;
     ta_python_payload_for payload = {0, {spawn.segment, spawn.chart}, params, 0, TA_NIL};
     if (ta_python_text(name, &spawn.name) == 0 && ta_python_text(traceparent, &spawn.traceparent) == 0 &&
         ta_python_host_payload(host, &payload) == 0) {
@@ -832,24 +1061,201 @@ static PyObject *ta_python_host_spawn(PyObject *self, PyObject *arguments, PyObj
         ta_python_advance(host);
         ta_status status = ta_host_spawn(host->host, &spawn, &session);
         if (status != TA_OK) ta_python_host_payload_release(host, payload.payload, payload.datamodel);
-        result = status == TA_OK ? PyLong_FromUnsignedLongLong(session) : ta_python_host_status(host, status);
+        result = status == TA_OK ? ta_python_actor_new(host, session) : ta_python_host_status(host, status);
         if (status == TA_OK) ta_python_loop_schedule(host);
     }
     ta_python_leave(&call);
     return result;
 }
 
+/* actor(session, name or address) -> Actor: a live actor of the host, by
+ * its session (ta_host_locate), the name it was spawned with
+ * (ta_host_actor_by_name, newest segment first) or a local address
+ * (ta_host_resolve); none: TA_ERROR_STALE. */
+static PyObject *ta_python_host_actor(PyObject *self, PyObject *which) {
+    ta_python_host *host = (ta_python_host *)self;
+    ta_python_call call;
+    if (ta_python_enter(host, &call) < 0) return NULL;
+    uint64_t session = 0;
+    ta_status status = TA_OK;
+    PyObject *text = Py_IS_TYPE(which, (PyTypeObject *)host->state->address_type) ? ((ta_python_address *)which)->text
+                                                                                   : which;
+    ta_string_view view;
+    if (PyUnicode_Check(text)) {
+        if (ta_python_text(text, &view) < 0) status = TA_ERROR_INVALID;
+        else if (text != which || (view.length > 13 && !memcmp(view.pointer, "tinyactors://", 13)))
+            status = ta_host_resolve(host->host, view, &session);
+        else session = ta_host_actor_by_name(host->host, view);
+    } else if (ta_python_session(host, which, &session) < 0) status = TA_ERROR_INVALID;
+    else status = ta_host_locate(host->host, session, &(ta_host_location){0, 0});
+    if (status == TA_OK && !session) status = TA_ERROR_STALE;
+    PyObject *result = NULL;
+    if (status == TA_OK) result = ta_python_actor_new(host, session);
+    else if (!PyErr_Occurred()) ta_python_raise_status(host->state, status);
+    ta_python_leave(&call);
+    return result;
+}
+
+/* ---- ask: a request and its reply over a send ---------------------------------- */
+
+void ta_python_asks_drop(ta_python_host *host) {
+    for (uint32_t slot = 0; slot < host->asks.capacity; slot++) {
+        ta_python_ask_row *row = ta_table_at(&host->asks, slot);
+        if (!row) continue;
+        PyObject *future = row->future;
+        ta_table_remove(&host->asks, ta_table_handle(&host->asks, slot));
+        Py_XDECREF(future); /* never completes */
+    }
+}
+
+/* The ask's future is done (cancelled, by asyncio.wait_for say): its row
+ * goes, so a late reply finds a stale handle. `self` is (host, handle). */
+static PyObject *ta_python_ask_done(PyObject *self, PyObject *future) {
+    ta_python_host *host = (ta_python_host *)PyTuple_GetItem(self, 0);
+    uint64_t handle = PyLong_AsUnsignedLongLong(PyTuple_GetItem(self, 1));
+    ta_python_ask_row *row = host->host ? ta_table_get(&host->asks, handle) : NULL;
+    if (row && row->future == future) {
+        ta_table_remove(&host->asks, handle);
+        Py_DECREF(future);
+    }
+    PyErr_Clear();
+    Py_RETURN_NONE;
+}
+
+static PyMethodDef ta_python_ask_done_def = {"done", ta_python_ask_done, METH_O, "An ask's future is done."};
+
+/* _ask(session, event, data): Actor.ask. A row of the asks table holds
+ * the future; the event goes with origin tinyactors://tinyactors-ask/@<the
+ * row's handle>, so the chart's <send targetexpr="_event.origin"> reaches
+ * the transport, where the reply settles the future with (event, data). */
+static PyObject *ta_python_host_ask(PyObject *self, PyObject *arguments) {
+    ta_python_host *host = (ta_python_host *)self;
+    PyObject *session, *event, *data = Py_None;
+    if (!PyArg_ParseTuple(arguments, "OU|O:ask", &session, &event, &data)) return NULL;
+    if (host->loop == Py_None) {
+        PyErr_SetString(PyExc_TypeError, "ask() returns an awaitable, which needs the asyncio driver (async with Host(...))");
+        return NULL;
+    }
+    ta_python_call call;
+    if (ta_python_enter(host, &call) < 0) return NULL;
+    uint64_t handle = 0;
+    PyObject *future = PyObject_CallMethod(host->loop, "create_future", NULL), *result = NULL;
+    ta_python_ask_row *row = future ? ta_table_add(&host->asks, &handle) : NULL;
+    if (future && !row) PyErr_NoMemory();
+    if (row) {
+        row->future = Py_NewRef(future);
+        PyObject *origin = PyUnicode_FromFormat(TA_PYTHON_ASK_PREFIX "%llu", (unsigned long long)handle);
+        PyObject *send = origin ? PyObject_GetAttrString(self, "send") : NULL;
+        PyObject *positional = send ? PyTuple_Pack(3, session, event, data) : NULL;
+        PyObject *keywords = positional ? Py_BuildValue("{s:O}", "origin", origin) : NULL;
+        PyObject *sent = keywords ? PyObject_Call(send, positional, keywords) : NULL;
+        PyObject *key = sent ? Py_BuildValue("(OK)", self, (unsigned long long)handle) : NULL;
+        PyObject *done = key ? PyCFunction_New(&ta_python_ask_done_def, key) : NULL;
+        PyObject *added = done ? PyObject_CallMethod(future, "add_done_callback", "O", done) : NULL;
+        if (added) result = Py_NewRef(future);
+        else if ((row = ta_table_get(&host->asks, handle))) { /* refused: no reply comes */
+            PyObject *dropped = row->future;
+            ta_table_remove(&host->asks, handle);
+            Py_DECREF(dropped);
+        }
+        Py_XDECREF(added);
+        Py_XDECREF(done);
+        Py_XDECREF(key);
+        Py_XDECREF(sent);
+        Py_XDECREF(keywords);
+        Py_XDECREF(positional);
+        Py_XDECREF(send);
+        Py_XDECREF(origin);
+    }
+    Py_XDECREF(future);
+    ta_python_leave(&call);
+    return result;
+}
+
+/* actors(chart=None): an awaitable of the live actors (actor.list, a page
+ * at a time; support.actors), or those of the chart named `chart`. */
+static PyObject *ta_python_host_actors(PyObject *self, PyObject *arguments, PyObject *keywords) {
+    static char *const names[] = {"chart", NULL};
+    ta_python_host *host = (ta_python_host *)self;
+    PyObject *chart = Py_None;
+    if (!PyArg_ParseTupleAndKeywords(arguments, keywords, "|O:actors", names, &chart)) return NULL;
+    if (chart != Py_None && !PyUnicode_Check(chart)) {
+        PyErr_SetString(PyExc_TypeError, "actors(chart=None): chart is a chart's name");
+        return NULL;
+    }
+    if (host->loop == Py_None) {
+        PyErr_SetString(PyExc_TypeError, "actors() returns an awaitable, which needs the asyncio driver (async with Host(...))");
+        return NULL;
+    }
+    return PyObject_CallFunctionObjArgs(host->state->host_actors, self, chart, NULL);
+}
+
+/* _chart_of(session) -> str or None: the name of the session's chart
+ * (ta_host_locate, ta_actor_info_get, ta_image_chart_name), for actors(). */
+static PyObject *ta_python_host_chart_of(PyObject *self, PyObject *value) {
+    ta_python_host *host = (ta_python_host *)self;
+    uint64_t session;
+    if (ta_python_session(host, value, &session) < 0) return NULL;
+    ta_python_call call;
+    if (ta_python_enter(host, &call) < 0) return NULL;
+    PyObject *result = NULL;
+    ta_host_location location;
+    ta_system *system = ta_host_locate(host->host, session, &location) == TA_OK ? ta_host_system(host->host, location.segment) : NULL;
+    ta_actor_info info;
+    memset(&info, 0, sizeof info);
+    info.size = sizeof info;
+    ta_host_segment_info segment;
+    memset(&segment, 0, sizeof segment);
+    segment.size = sizeof segment;
+    if (system && ta_actor_info_get(system, location.actor, &info) == TA_OK &&
+        ta_host_segment_info_get(host->host, location.segment, &segment) == TA_OK && segment.image) {
+        ta_string_view name = ta_image_chart_name(segment.image, info.chart);
+        result = PyUnicode_DecodeUTF8(name.pointer ? name.pointer : "", (Py_ssize_t)name.length, "strict");
+    } else result = Py_NewRef(Py_None);
+    ta_python_leave(&call);
+    return result;
+}
+
+/* _done(session): the future Actor.done awaits, kept in a dict by session
+ * while someone awaits it; settled at the actor's DONE or ERROR. */
+static PyObject *ta_python_host_done(PyObject *self, PyObject *value) {
+    ta_python_host *host = (ta_python_host *)self;
+    uint64_t session;
+    if (ta_python_session(host, value, &session) < 0) return NULL;
+    ta_python_call call;
+    if (ta_python_enter(host, &call) < 0) return NULL;
+    PyObject *result = NULL, *key = NULL;
+    if (host->loop == Py_None)
+        PyErr_SetString(PyExc_TypeError, "Actor.done is an awaitable, which needs the asyncio driver (async with Host(...))");
+    else if (ta_host_locate(host->host, session, &(ta_host_location){0, 0}) != TA_OK)
+        ta_python_raise_status(host->state, TA_ERROR_STALE); /* it ended: its donedata is gone */
+    else if ((key = PyLong_FromUnsignedLongLong(session)) && PyDict_GetItemRef(host->done, key, &result) == 0) {
+        result = PyObject_CallMethod(host->loop, "create_future", NULL);
+        if (result && PyDict_SetItem(host->done, key, result) < 0) Py_CLEAR(result);
+    }
+    Py_XDECREF(key);
+    ta_python_leave(&call);
+    return result;
+}
+
 /* An event of send or send_many: fills `event` and its payload. */
 typedef struct ta_python_send_item {
-    PyObject *target, *name, *data, *traceparent, *origin;
+    PyObject *target, *name, *data, *traceparent, *origin, *sendid;
     uint32_t datamodel; /* out: the payload's */
 } ta_python_send_item;
+
+/* An Address given where core takes an address's text: its text. */
+static PyObject *ta_python_unwrap_address(ta_python_host *host, PyObject *value) {
+    return value && Py_IS_TYPE(value, (PyTypeObject *)host->state->address_type) ? ((ta_python_address *)value)->text
+                                                                                    : value;
+}
 
 /* A send's target: a session, or a local address core resolves to one
  * (ta_host_resolve), before the payload is made in that session's
  * datamodel. */
 static int ta_python_target(ta_python_host *host, PyObject *target, uint64_t *session) {
-    if (!PyUnicode_Check(target)) return ta_python_session(target, session);
+    target = ta_python_unwrap_address(host, target);
+    if (!PyUnicode_Check(target)) return ta_python_session(host, target, session);
     ta_string_view address;
     if (ta_python_text(target, &address) < 0) return -1;
     ta_status status = ta_host_resolve(host->host, address, session);
@@ -865,7 +1271,9 @@ static int ta_python_event(ta_python_host *host, ta_python_send_item *item, ta_e
     event->size = sizeof *event;
     item->datamodel = TA_NIL;
     if (ta_python_target(host, item->target, &event->session) < 0 ||
-        ta_python_text(item->traceparent, &event->traceparent) < 0 || ta_python_text(item->origin, &event->origin) < 0)
+        ta_python_text(item->traceparent, &event->traceparent) < 0 ||
+        ta_python_text(ta_python_unwrap_address(host, item->origin), &event->origin) < 0 ||
+        ta_python_text(item->sendid, &event->sendid) < 0)
         return -1;
     if (!PyUnicode_Check(item->name)) {
         PyErr_SetString(PyExc_TypeError, "an event's name is a str");
@@ -879,21 +1287,73 @@ static int ta_python_event(ta_python_host *host, ta_python_send_item *item, ta_e
     return 0;
 }
 
+/* A message from another system, the dict send.message gives: its known
+ * keys into `item`, each a reference in `held` (released by the caller), the
+ * others ignored, so a newer sender's keys do not break an older host. */
+#define TA_PYTHON_MESSAGE_KEYS 6
+static int ta_python_message_item(PyObject *message, ta_python_send_item *item, PyObject **held) {
+    static const char *const keys[] = {"target", "event", "data", "sendid", "origin", "traceparent"};
+    PyObject **slots[] = {&item->target, &item->name, &item->data, &item->sendid, &item->origin, &item->traceparent};
+    for (int i = 0; i < TA_PYTHON_MESSAGE_KEYS; i++) {
+        if (PyDict_GetItemStringRef(message, keys[i], &held[i]) < 0) return -1;
+        if (held[i]) *slots[i] = held[i];
+    }
+    if (!item->target || !item->name) {
+        PyErr_SetString(PyExc_TypeError, "a message has a target and an event");
+        return -1;
+    }
+    return 0;
+}
+
 static PyObject *ta_python_host_send(PyObject *self, PyObject *arguments, PyObject *keywords) {
-    static char *const names[] = {"target", "event", "data", "traceparent", "origin", NULL};
+    static char *const names[] = {"target", "event", "data", "sendid", "traceparent", "origin", NULL};
     ta_python_host *host = (ta_python_host *)self;
-    ta_python_send_item item = {NULL, NULL, Py_None, Py_None, Py_None, TA_NIL};
-    if (!PyArg_ParseTupleAndKeywords(arguments, keywords, "OO|O$OO:send", names, &item.target, &item.name, &item.data,
-                                     &item.traceparent, &item.origin))
-        return NULL;
+    ta_python_send_item item = {NULL, NULL, Py_None, Py_None, Py_None, Py_None, TA_NIL};
+    PyObject *held[TA_PYTHON_MESSAGE_KEYS] = {NULL};
+    PyObject *result = NULL;
+    int parsed = PyTuple_Size(arguments) == 1 && (!keywords || !PyDict_Size(keywords)) &&
+                         PyDict_Check(PyTuple_GetItem(arguments, 0)) /* send(message) */
+                     ? ta_python_message_item(PyTuple_GetItem(arguments, 0), &item, held) == 0
+                     : PyArg_ParseTupleAndKeywords(arguments, keywords, "OO|O$OOO:send", names, &item.target,
+                                                   &item.name, &item.data, &item.sendid, &item.traceparent,
+                                                   &item.origin);
+    /* UNDEFINED, as another binding's absent field decodes, is absent too */
+    PyObject **absent[] = {&item.sendid, &item.origin, &item.traceparent};
+    for (int i = 0; parsed && i < 3; i++)
+        if (*absent[i] == host->state->undefined) *absent[i] = Py_None;
+    ta_python_call call;
+    if (parsed && ta_python_enter(host, &call) == 0) {
+        ta_event_in event;
+        if (ta_python_event(host, &item, &event) == 0) {
+            ta_status status = ta_host_send(host->host, &event);
+            if (status != TA_OK) ta_python_host_payload_release(host, event.data, item.datamodel);
+            else ta_python_loop_schedule(host);
+            result = ta_python_host_status(host, status);
+        }
+        ta_python_leave(&call);
+    }
+    for (int i = 0; i < TA_PYTHON_MESSAGE_KEYS; i++) Py_XDECREF(held[i]);
+    return result;
+}
+
+/* fail(target, sendid=None): a send the application's transport could not
+ * deliver, reported to its sender (error.communication with the sendid),
+ * when the application decides to believe the other side. */
+static PyObject *ta_python_host_fail(PyObject *self, PyObject *arguments, PyObject *keywords) {
+    static char *const names[] = {"target", "sendid", NULL};
+    ta_python_host *host = (ta_python_host *)self;
+    PyObject *target, *sendid = Py_None;
+    if (!PyArg_ParseTupleAndKeywords(arguments, keywords, "O|O:fail", names, &target, &sendid)) return NULL;
     ta_python_call call;
     if (ta_python_enter(host, &call) < 0) return NULL;
     PyObject *result = NULL;
     ta_event_in event;
-    if (ta_python_event(host, &item, &event) == 0) {
+    memset(&event, 0, sizeof event);
+    event.size = sizeof event;
+    event.flags = TA_EVENT_IN_ERROR_COMMUNICATION;
+    if (ta_python_target(host, target, &event.session) == 0 && ta_python_text(sendid, &event.sendid) == 0) {
         ta_status status = ta_host_send(host->host, &event);
-        if (status != TA_OK) ta_python_host_payload_release(host, event.data, item.datamodel);
-        else ta_python_loop_schedule(host);
+        if (status == TA_OK) ta_python_loop_schedule(host);
         result = ta_python_host_status(host, status);
     }
     ta_python_leave(&call);
@@ -929,7 +1389,7 @@ static Py_ssize_t ta_python_send_slice(ta_python_host *host, const ta_python_sli
             }
             ta_python_send_item item = {PyTuple_GetItem(entry, 0), PyTuple_GetItem(entry, 1),
                                         size > 2 ? PyTuple_GetItem(entry, 2) : Py_None,
-                                        size > 3 ? PyTuple_GetItem(entry, 3) : Py_None, Py_None, TA_NIL};
+                                        size > 3 ? PyTuple_GetItem(entry, 3) : Py_None, Py_None, Py_None, TA_NIL};
             if (ta_python_event(host, &item, &events[made]) < 0) break;
             datamodels[made] = item.datamodel;
         }
@@ -967,12 +1427,24 @@ static PyObject *ta_python_host_send_many(PyObject *self, PyObject *items) {
     return result;
 }
 
+/* The session is hibernated now (its blob is the application's). */
+static int ta_python_session_hibernated(ta_python_host *host, uint64_t session) {
+    ta_host_location location;
+    ta_system *system = ta_host_locate(host->host, session, &location) == TA_OK ? ta_host_system(host->host, location.segment) : NULL;
+    ta_actor_info info;
+    memset(&info, 0, sizeof info);
+    info.size = sizeof info;
+    return system && ta_actor_info_get(system, location.actor, &info) == TA_OK && info.state == TA_ACTOR_HIBERNATED;
+}
+
 static PyObject *ta_python_host_terminate(PyObject *self, PyObject *value) {
     ta_python_host *host = (ta_python_host *)self;
     uint64_t session;
-    if (ta_python_session(value, &session) < 0) return NULL;
+    if (ta_python_session(host, value, &session) < 0) return NULL;
     ta_python_call call;
     if (ta_python_enter(host, &call) < 0) return NULL;
+    /* a hibernated actor is woken to end it (its <onexit> runs): core gives a WAKE, which loads its
+       blob from the store and deletes it there, so the blob is not deleted here */
     ta_status status = ta_host_terminate(host->host, session);
     if (status == TA_OK) ta_python_loop_schedule(host);
     PyObject *result = ta_python_host_status(host, status);
@@ -1076,11 +1548,8 @@ static PyObject *ta_python_host_output(ta_python_host *host, ta_bytes taken) {
  * application's to store until it gives it to wake. */
 static PyObject *ta_python_host_hibernate(PyObject *self, PyObject *value) {
     ta_python_host *host = (ta_python_host *)self;
-    uint64_t session = PyLong_Check(value) ? PyLong_AsUnsignedLongLong(value) : 0;
-    if (PyErr_Occurred() || !PyLong_Check(value)) {
-        if (!PyErr_Occurred()) PyErr_SetString(PyExc_TypeError, "a session is an int");
-        return NULL;
-    }
+    uint64_t session;
+    if (ta_python_session(host, value, &session) < 0) return NULL;
     ta_python_call call;
     if (ta_python_enter(host, &call) < 0) return NULL;
     ta_bytes taken;
@@ -1088,12 +1557,136 @@ static PyObject *ta_python_host_hibernate(PyObject *self, PyObject *value) {
     PyObject *result = NULL;
     if (status == TA_OK) {
         result = PyBytes_FromStringAndSize(taken.pointer, (Py_ssize_t)taken.length);
-        if (!result) ta_host_wake(host->host, session, taken); /* the copy failed: back from the view, still
-                                                                  valid, or the actor would have no blob */
+        if (!result) { /* the copy failed: back from the view, still valid, or the actor would have no blob */
+            PyObject *raised = PyErr_GetRaisedException(); /* the wake runs the datamodel's Python code */
+            ta_host_wake(host->host, session, taken);
+            PyErr_SetRaisedException(raised);
+        }
         ta_python_host_output_done(host);
     } else ta_python_raise_status(host->state, status); /* TA_ERROR_STATE: not at a stable point */
     ta_python_leave(&call);
     return result;
+}
+
+/* ---- the store: hibernation the host does itself -------------------------------- */
+
+static int ta_python_session_hibernated(ta_python_host *host, uint64_t session);
+
+/* The actors in memory now: every live segment's actors less its hibernated ones. */
+static uint64_t ta_python_resident_count(ta_python_host *host) {
+    uint64_t resident = 0;
+    for (uint32_t segment = 0; segment < ta_host_segment_count(host->host); segment++) {
+        ta_system *system = ta_host_system(host->host, segment);
+        if (!system) continue; /* freed */
+        ta_system_stats stats;
+        memset(&stats, 0, sizeof stats);
+        stats.size = sizeof stats;
+        ta_system_stats_get(system, &stats);
+        resident += stats.actors - stats.hibernated;
+    }
+    return resident;
+}
+
+/* One session hibernated into the store: its blob copied once and saved;
+ * an actor that cannot hibernate now (not at rest, a value outside the
+ * table) stays. A save that raises: the actor is woken back from the view,
+ * still valid before the ack, and the exception kept. */
+static void ta_python_host_store_one(ta_python_host *host, uint64_t session) {
+    ta_bytes taken;
+    ta_status status = ta_host_hibernate(host->host, session, &taken);
+    if (status == TA_ERROR_STATE || status == TA_ERROR_UNSUPPORTED) return; /* it stays resident */
+    if (status != TA_OK) {
+        ta_python_raise_status(host->state, status);
+        ta_python_host_keep_error(host);
+        return;
+    }
+    PyObject *blob = PyBytes_FromStringAndSize(taken.pointer, (Py_ssize_t)taken.length);
+    PyObject *key = blob ? PyLong_FromUnsignedLongLong(session) : NULL;
+    PyObject *saved = key ? PyObject_CallMethod(host->store, "save", "OO", key, blob) : NULL;
+    if (!saved) {
+        PyObject *raised = PyErr_GetRaisedException(); /* the wake runs the datamodel's Python code */
+        ta_host_wake(host->host, session, taken);       /* back from the view, or the actor would have no blob */
+        PyErr_SetRaisedException(raised);
+        ta_python_handler_failed(host, NULL);
+    }
+    Py_XDECREF(saved);
+    Py_XDECREF(key);
+    Py_XDECREF(blob);
+    ta_python_host_output_done(host);
+}
+
+/* Sessions swept at once: the arena holds a slice, not the whole surplus. */
+#define TA_PYTHON_EVICT_SLICE 1024u
+
+/* Down to the bound: the CLOCK sweep takes the actors that did not run
+ * since the last one, so a revolution marks the others, a second finds
+ * them, a third whatever ran in between. */
+static void ta_python_host_hibernate_surplus(ta_python_host *host, uint64_t target) {
+    uint64_t first = ta_python_resident_count(host);
+    uint64_t sweeps = first > target ? 3 + (first - target) / TA_PYTHON_EVICT_SLICE : 0;
+    for (uint64_t sweep = 0; sweep < sweeps; sweep++) {
+        uint64_t resident = sweep ? ta_python_resident_count(host) : first;
+        if (resident <= target) return;
+        uint64_t surplus = resident - target;
+        uint32_t limit = surplus < TA_PYTHON_EVICT_SLICE ? (uint32_t)surplus : TA_PYTHON_EVICT_SLICE;
+        ta_growable_arena_mark mark = ta_growable_arena_position(&host->arena);
+        uint64_t *sessions = ta_growable_arena_alloc(&host->arena, sizeof(uint64_t) * limit, 8);
+        uint32_t found = sessions ? ta_host_sweep(host->host, UINT32_MAX, (ta_uint64_array){sessions, limit}) : 0;
+        for (uint32_t i = 0; i < found; i++) ta_python_host_store_one(host, sessions[i]);
+        ta_growable_arena_release(&host->arena, mark);
+    }
+}
+
+int ta_python_host_defer(ta_python_host *host, uint64_t session) {
+    if (!host->resident || host->store == Py_None || ta_python_resident_count(host) < host->resident) return 0;
+    PyObject *key = PyLong_FromUnsignedLongLong(session);
+    int status = key ? PyDict_SetItem(host->asked, key, Py_None) : -1;
+    Py_XDECREF(key);
+    if (status < 0) {
+        ta_python_host_keep_error(host);
+        return 0;
+    }
+    return 1;
+}
+
+void ta_python_host_evict(ta_python_host *host) {
+    if (!host->resident || !host->store || host->store == Py_None || !host->host || host->batch) return;
+    /* the migration's WAKEs deferred for room: room made for them (the actors at rest go), then loaded
+       while there is some (they run, and move, in the next turns) */
+    uint64_t waiting = host->asked ? (uint64_t)PyDict_Size(host->asked) : 0;
+    ta_python_host_hibernate_surplus(host, waiting < host->resident ? host->resident - waiting : 0);
+    while (host->asked && PyDict_Size(host->asked) && ta_python_resident_count(host) < host->resident) {
+        PyObject *pair = PyObject_CallMethod(host->asked, "popitem", NULL);
+        uint64_t session = pair ? PyLong_AsUnsignedLongLong(PyTuple_GetItem(pair, 0)) : 0;
+        Py_XDECREF(pair);
+        if (!pair || PyErr_Occurred()) {
+            ta_python_host_keep_error(host);
+            return;
+        }
+        if (ta_python_session_hibernated(host, session)) ta_python_host_load(host, session);
+    }
+}
+
+void ta_python_host_load(ta_python_host *host, uint64_t session) {
+    if (!host->store || host->store == Py_None) return; /* the session stays hibernated: its events wait */
+    PyObject *key = PyLong_FromUnsignedLongLong(session);
+    PyObject *blob = key ? PyObject_CallMethod(host->store, "load", "O", key) : NULL;
+    Py_buffer view;
+    if (blob && PyObject_GetBuffer(blob, &view, PyBUF_SIMPLE) == 0) {
+        ta_status status = ta_host_wake(host->host, session, (ta_bytes){view.buf, (size_t)view.len});
+        PyBuffer_Release(&view);
+        if (status != TA_OK) {
+            ta_python_raise_status(host->state, status);
+            ta_python_host_keep_error(host);
+        } else {
+            ta_python_loop_schedule(host); /* its mailbox runs at the next turn */
+            PyObject *deleted = PyObject_CallMethod(host->store, "delete", "O", key); /* the blob is spent */
+            if (!deleted) ta_python_handler_failed(host, NULL);
+            Py_XDECREF(deleted);
+        }
+    } else ta_python_handler_failed(host, NULL); /* load raised, or gave no bytes: the session stays hibernated */
+    Py_XDECREF(blob);
+    Py_XDECREF(key);
 }
 
 /* wake(session, blob): ta_host_wake, with the blob hibernate gave. */
@@ -1101,9 +1694,9 @@ static PyObject *ta_python_host_wake(PyObject *self, PyObject *arguments) {
     ta_python_host *host = (ta_python_host *)self;
     PyObject *session_object;
     Py_buffer view;
-    if (!PyArg_ParseTuple(arguments, "O!y*:wake", &PyLong_Type, &session_object, &view)) return NULL;
-    uint64_t session = PyLong_AsUnsignedLongLong(session_object);
-    if (PyErr_Occurred()) { /* negative or wider than 64 bits: OverflowError */
+    if (!PyArg_ParseTuple(arguments, "Oy*:wake", &session_object, &view)) return NULL;
+    uint64_t session = 0;
+    if (ta_python_session(host, session_object, &session) < 0) { /* negative or wider than 64 bits: OverflowError */
         PyBuffer_Release(&view);
         return NULL;
     }
@@ -1153,8 +1746,8 @@ static PyObject *ta_python_host_migrate(PyObject *self, PyObject *arguments, PyO
         request.name = (ta_string_view){name, (size_t)length};
     }
     if (session != Py_None) {
-        request.session = PyLong_Check(session) ? PyLong_AsUnsignedLongLong(session) : 0;
-        if (!PyErr_Occurred() && !request.session) PyErr_SetString(PyExc_ValueError, "session is a session id (int) or None");
+        if (ta_python_session(host, session, &request.session) < 0) return NULL;
+        if (!request.session) PyErr_SetString(PyExc_ValueError, "session is a session id (int) or None");
         if (PyErr_Occurred()) return NULL;
     }
     if (timeout) {
@@ -1180,7 +1773,7 @@ static PyObject *ta_python_host_migrate(PyObject *self, PyObject *arguments, PyO
 }
 
 static PyObject *ta_python_host_create(PyTypeObject *type, PyObject *arguments, PyObject *keywords) {
-    return ta_python_host_build(type, &(ta_python_build){arguments, keywords, NULL});
+    return ta_python_host_parse(type, &(ta_python_build){arguments, keywords, NULL});
 }
 
 /* ---- snapshots: the whole host to bytes and back ------------------------------------ */
@@ -1206,7 +1799,7 @@ static PyObject *ta_python_host_restore(PyObject *type, PyObject *arguments, PyO
         if (aligned) pack = (ta_bytes){PyBytes_AsString(aligned), (size_t)view.len};
     }
     PyObject *host = !((uintptr_t)view.buf & 7u) || aligned
-                         ? ta_python_host_build((PyTypeObject *)type, &(ta_python_build){rest, keywords, &pack})
+                         ? ta_python_host_parse((PyTypeObject *)type, &(ta_python_build){rest, keywords, &pack})
                          : NULL;
     PyBuffer_Release(&view);
     Py_XDECREF(aligned);
@@ -1312,9 +1905,14 @@ static PyObject *ta_python_host_enter_with(PyObject *self, PyObject *unused) {
                 return NULL;
             }
         }
-        if (host->wake_async || host->telemetry_async) {
-            PyErr_Format(PyExc_TypeError, "the %s handler is an async def: use async with, the synchronous driver runs no "
-                         "event loop", host->wake_async ? "wake" : "telemetry");
+        if (PyTuple_GetItem(host->transport, 2) == Py_True) {
+            PyErr_SetString(PyExc_TypeError,
+                            "the transport is an async def: use async with, the synchronous driver runs no event loop");
+            return NULL;
+        }
+        if (host->telemetry_async) {
+            PyErr_SetString(PyExc_TypeError, "the telemetry handler is an async def: use async with, the synchronous "
+                            "driver runs no event loop");
             return NULL;
         }
     }
@@ -1407,7 +2005,13 @@ static PyObject *ta_python_host_next_deadline(PyObject *self, void *closure) {
     return PyFloat_FromDouble(ta_python_delay(host));
 }
 
+static PyObject *ta_python_host_system(PyObject *self, void *closure) {
+    (void)closure;
+    return Py_NewRef(((ta_python_host *)self)->system_id);
+}
+
 static PyGetSetDef ta_python_host_properties[] = {
+    {"system", ta_python_host_system, NULL, ta_python_doc_host_system, NULL},
     {"closed", ta_python_host_closed, NULL, ta_python_doc_host_closed, NULL},
     {"ticks_per_second", ta_python_host_ticks, NULL, ta_python_doc_host_ticks, NULL},
     {"next_deadline", ta_python_host_next_deadline, NULL, ta_python_doc_host_next_deadline, NULL},
@@ -1433,11 +2037,17 @@ static PyMethodDef ta_python_host_methods[] = {
     {"add_image", ta_python_host_add_image, METH_O,
      ta_python_doc_host_add_image},
     {"chart", ta_python_host_chart, METH_O, ta_python_doc_host_chart},
-    {"actor_by_name", ta_python_host_actor_by_name, METH_O, ta_python_doc_host_actor_by_name},
+    {"actor", ta_python_host_actor, METH_O, ta_python_doc_host_actor},
+    {"actors", (PyCFunction)(void (*)(void))ta_python_host_actors, METH_VARARGS | METH_KEYWORDS, ta_python_doc_host_actors},
+    {"_chart_of", ta_python_host_chart_of, METH_O, NULL},
+    {"_done", ta_python_host_done, METH_O, NULL},
+    {"_ask", ta_python_host_ask, METH_VARARGS, NULL},
     {"spawn", (PyCFunction)(void (*)(void))ta_python_host_spawn, METH_VARARGS | METH_KEYWORDS,
      ta_python_doc_host_spawn},
     {"send", (PyCFunction)(void (*)(void))ta_python_host_send, METH_VARARGS | METH_KEYWORDS,
      ta_python_doc_host_send},
+    {"fail", (PyCFunction)(void (*)(void))ta_python_host_fail, METH_VARARGS | METH_KEYWORDS,
+     ta_python_doc_host_fail},
     {"send_many", ta_python_host_send_many, METH_O,
      ta_python_doc_host_send_many},
     {"terminate", ta_python_host_terminate, METH_O, ta_python_doc_host_terminate},
@@ -1458,8 +2068,6 @@ static PyMethodDef ta_python_host_methods[] = {
      ta_python_doc_host_migrate},
     {"run_until_idle", ta_python_host_run_until_idle, METH_NOARGS,
      ta_python_doc_host_run_until_idle},
-    {"run", ta_python_host_run_forever, METH_NOARGS,
-     ta_python_doc_host_run},
     {"idle", ta_python_host_idle, METH_NOARGS, ta_python_doc_host_idle},
     {"close", ta_python_host_close_method, METH_NOARGS,
      ta_python_doc_host_close},

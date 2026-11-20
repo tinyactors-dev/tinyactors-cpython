@@ -8,6 +8,7 @@ int ta_python_event_init_type(PyObject *module, ta_python_module_state *state);
 static PyMethodDef ta_python_methods[] = {
     {"encode", ta_python_encode, METH_O, ta_python_doc_encode},
     {"decode", ta_python_decode, METH_O, ta_python_doc_decode},
+    {"decode_traces", ta_python_decode_traces, METH_O, ta_python_doc_decode_traces},
     {"compile_charts", (PyCFunction)(void (*)(void))ta_python_compile_charts, METH_FASTCALL | METH_KEYWORDS,
      ta_python_doc_compile_charts},
     {"compile_system", (PyCFunction)(void (*)(void))ta_python_compile_system, METH_FASTCALL | METH_KEYWORDS,
@@ -37,7 +38,8 @@ ta_python_module_state *ta_python_state_of_type(PyTypeObject *type) {
     apply(compiled_type) apply(chart_type) apply(send_type) apply(entry_type)               \
     apply(migrated_type) apply(invocation_type)                                                                \
     apply(event_type) apply(support) apply(error) apply(compile_error) apply(resolve_error) apply(diagnostic)    \
-    apply(builtins) apply(attach) apply(check_file) apply(event_kinds) apply(event_key) apply(time_ns) apply(coroutine_function)
+    apply(builtins) apply(attach) apply(check_file) apply(settlers) apply(event_kinds) apply(event_key) apply(time_ns) apply(coroutine_function) \
+    apply(actor_type) apply(host_config) apply(host_actors)
 
 static int ta_python_module_traverse(PyObject *module, visitproc visit, void *arg) {
     ta_python_module_state *state = PyModule_GetState(module);
@@ -61,10 +63,15 @@ static void ta_python_module_free(void *module) {
     ta_python_module_clear((PyObject *)module);
 }
 
+#ifndef TA_PYTHON_VERSION
+#error "TA_PYTHON_VERSION is the build's version (mise/cpython.rb, version_define)"
+#endif
+
 /* The types and objects, once per module instance. */
 static int ta_python_module_exec(PyObject *module) {
     ta_python_module_state *state = PyModule_GetState(module);
-    if (ta_python_value_types_init(module) < 0 || ta_python_support_init(module, state) < 0 ||
+    if (PyModule_AddStringConstant(module, "__version__", TA_PYTHON_VERSION) < 0 ||
+        ta_python_value_types_init(module) < 0 || ta_python_support_init(module, state) < 0 ||
         ta_python_host_init_type(module, state) < 0 || ta_python_clock_init_type(module, state) < 0 ||
         ta_python_compile_init_type(module, state) < 0 || ta_python_effects_init_types(module, state) < 0 ||
         ta_python_event_init_type(module, state) < 0)

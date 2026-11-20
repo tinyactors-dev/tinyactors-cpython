@@ -61,16 +61,32 @@ def text(root):
     return ET.tostring(root, encoding="unicode")
 
 
-def host_with(documents, processors=None, sync=False, **options):
-    """A host on a simulated clock with one I/O processor of type APP, the
-    documents compiled into one image and added."""
-    config = {"systemID": "t", "system": {"ticksPerSecond": 1000},
-              "ioProcessors": [{"type": APP, "sync": sync}]}
+class Processor:
+    """An I/O processor whose receive(send) is `receive`: the tests' way to
+    give a function as the object Host takes."""
+
+    def __init__(self, receive, location=None):
+        self.receive = receive
+        if location is not None:
+            self.location = location
+
+
+def processors_of(processors):
+    """{type: Processor} of {type: function}; objects stay as they are."""
+    return {kind: Processor(each) if callable(each) and not hasattr(each, "receive") else each
+            for kind, each in (processors or {}).items()}
+
+
+def host_with(documents, processors=None, **options):
+    """A host on a simulated clock with one I/O processor of type APP (a
+    function given for it is its receive), the documents compiled into one
+    image."""
     options.setdefault("clock", tinyactors.SimulatedClock())
-    host = tinyactors.Host(config, processors if processors is not None else {}, **options)
+    options.setdefault("config", {"system": {"ticksPerSecond": 1000}})
+    processors = processors_of(processors if processors is not None else {})
+    processors.setdefault(APP, Processor(lambda send: send.fail()))
     with tinyactors.compile_charts(documents) as compiled:
-        host.add_image(compiled.image)
-    return host
+        return tinyactors.Host(compiled, system="t", io_processors=processors, **options)
 
 
 class Logs:
@@ -79,7 +95,7 @@ class Logs:
     def __init__(self):
         self.lines = []
 
-    def __call__(self, host, entry):
+    def __call__(self, entry):
         self.lines.append((entry.label, entry.text))
 
     def labelled(self, label):

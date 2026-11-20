@@ -11,7 +11,7 @@
 typedef struct ta_python_compiled {
     PyObject_HEAD
     ta_compile_result *result; /* NULL once closed */
-    Py_ssize_t exports;        /* buffers of `image` held */
+    PyObject *image;           /* the image's bytes, copied at the first read; NULL before */
     PyObject *diagnostics;
 } ta_python_compiled;
 
@@ -259,34 +259,20 @@ PyObject *ta_python_compile_system(PyObject *module, PyObject *const *args, Py_s
 
 /* ---- Compiled -------------------------------------------------------------------------- */
 
-static int ta_python_compiled_getbuffer(PyObject *self, Py_buffer *view, int flags) {
-    ta_python_compiled *compiled = (ta_python_compiled *)self;
-    if (!compiled->result) {
-        PyErr_SetString(PyExc_BufferError, "the compile result was closed");
-        return -1;
-    }
-    ta_string_view image = ta_compile_image(compiled->result);
-    if (PyBuffer_FillInfo(view, self, (void *)image.pointer, image.length, 1, flags) < 0) return -1;
-    compiled->exports++;
-    return 0;
-}
-
-static void ta_python_compiled_releasebuffer(PyObject *self, Py_buffer *view) {
-    (void)view;
-    ((ta_python_compiled *)self)->exports--;
-}
-
-/* A thin view of the image's bytes: a read-only memoryview over the
- * result, valid until close(). */
+/* The image's bytes, copied once at the first read and kept: valid after
+ * close() too. A first read after close() is stale: the result is freed. */
 static PyObject *ta_python_compiled_image(PyObject *self, void *closure) {
     (void)closure;
     ta_python_compiled *compiled = (ta_python_compiled *)self;
+    if (compiled->image) return Py_NewRef(compiled->image);
     if (!compiled->result) {
         ta_python_module_state *state = ta_python_state_of_type(Py_TYPE(self));
         if (state) ta_python_raise_status(state, TA_ERROR_STALE);
         return NULL;
     }
-    return PyMemoryView_FromObject(self);
+    ta_string_view image = ta_compile_image(compiled->result);
+    compiled->image = PyBytes_FromStringAndSize(image.pointer, (Py_ssize_t)image.length);
+    return compiled->image ? Py_NewRef(compiled->image) : NULL;
 }
 
 static PyObject *ta_python_compiled_diagnostics(PyObject *self, void *closure) {
@@ -297,10 +283,6 @@ static PyObject *ta_python_compiled_diagnostics(PyObject *self, void *closure) {
 static PyObject *ta_python_compiled_close(PyObject *self, PyObject *unused) {
     (void)unused;
     ta_python_compiled *compiled = (ta_python_compiled *)self;
-    if (compiled->exports > 0) { /* as bytearray: a held buffer would read freed memory */
-        PyErr_SetString(PyExc_BufferError, "close() while a buffer of Compiled.image is held: release it first");
-        return NULL;
-    }
     if (compiled->result) ta_compile_free(compiled->result);
     compiled->result = NULL;
     Py_RETURN_NONE;
@@ -323,6 +305,7 @@ static void ta_python_compiled_dealloc(PyObject *self) {
     PyTypeObject *type = Py_TYPE(self);
     ta_python_compiled *compiled = (ta_python_compiled *)self;
     if (compiled->result) ta_compile_free(compiled->result); /* the collector's fallback */
+    Py_XDECREF(compiled->image);
     Py_XDECREF(compiled->diagnostics);
     freefunc ta_python_release = (freefunc)PyType_GetSlot(type, Py_tp_free);
     ta_python_release(self);
@@ -347,8 +330,6 @@ static PyType_Slot ta_python_compiled_slots[] = {
     {Py_tp_dealloc, ta_python_compiled_dealloc},
     {Py_tp_getset, ta_python_compiled_properties},
     {Py_tp_methods, ta_python_compiled_methods},
-    {Py_bf_getbuffer, ta_python_compiled_getbuffer},
-    {Py_bf_releasebuffer, ta_python_compiled_releasebuffer},
     {0, NULL}
 };
 

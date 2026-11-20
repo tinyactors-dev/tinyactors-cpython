@@ -39,20 +39,27 @@ layers"):
   takes the chart reference `chart` returns, `Host.add_image` is
   `ta_host_add_image` and returns the segment. Everything below ("The
   API") is this layer, and it is what step 8.4 builds.
-- **A convenience layer, pure Python on top, is later work and not built
-  now.** It calls only the direct layer and adds shapes, not behaviour:
-  an `add_image` from a name→text mapping (compile, add, close in one
-  call; the earlier `add_image(charts)` belongs here), spawning by chart
-  name, a chart builder so people need not write XML (over
-  `ta_xml_writer`, `compile.h:84-110`, once the direct layer exposes it),
-  and **`DirectoryResolver(root)`** (decided 2026-10-13): a resolver
-  written in Python that reads `source` as a file under `root`, relative
-  to `base`, and refuses a path that leaves `root`. It does not bind
-  core's file resolver: `ta_runtime_resolve`
+- **The application API** (the maintainer, 2026-11-19; root
+  `ROADMAP.md`, step 8.6, "The shape of items 1 to 9") is built on the
+  direct layer's calls, in the same extension, and is what applications
+  use: `Host(charts, system=..., ...)` adds its images at creation;
+  I/O processors are objects with `receive(send)`; handlers take no host
+  (each view and record has `.host`); `Actor` handles; `store=` and
+  `resident=`; `on_done`, `on_error`, `on_handler_error`; `compile_dir`;
+  `ask`; `Spawner`. It adds no
+  request to core. Where it is plain Python over the public calls it
+  lives in `src/datamodel/support.py` (`Actor`, `MemoryStore`,
+  `SQLiteStore`, `Spawner`, `compile_dir`, `host_config`, `actors`), exported by the module; the
+  rest is C beside the direct layer's (`host.c`, `effects.c`). The
+  direct layer's calls stay (`chart`, `add_image`, `sweep`, `hibernate`,
+  `wake`, the typed methods), as operator calls for an application with
+  its own policy.
+- **No other convenience layer is built now.** A chart builder so people
+  need not write XML (over `ta_xml_writer`, `compile.h:84-110`, once the
+  direct layer exposes it) waits. A resolver that reads a directory does
+  not bind core's file resolver: `ta_runtime_resolve`
   (`tinyactors-core/src/runtime/runtime_hosted.c:78`) accepts absolute
-  paths and does not confine reads to a root. The direct layer has only
-  the resolver ("The resolver").
-  Nothing in 8.4 depends on it.
+  paths and does not confine reads to a root.
 
 ## Names
 
@@ -85,24 +92,54 @@ Decided by the maintainer (2026-10-13); every item is in
   resolver, and the `<actor name chart>`s `host.boot` spawns. The same
   path as `compile_charts` (`ta_python_compile` takes a
   `ta_python_compilation`), the same `Compiled` and `CompileError`.
-- **`Compiled`** holds the compile result: **`compiled.image`** is a thin
-  view of `ta_compile_image`'s bytes (a read-only buffer, valid until
-  `close`; a read after it raises `TinyactorsError` with
-  `TA_ERROR_STALE`), **`compiled.diagnostics`** the warnings and notes
+- **`tinyactors.compile_dir(path, *, resolver=None) -> Compiled`**
+  (2026-11-19, step 8.6 item 1; support.py): every `*.scxml` under
+  `path`, sorted, named by its path under it, given to `compile_charts`
+  with a resolver confined to `path` (a `src` relative to its document,
+  its real path refused with `ResolveError` when it leaves `path`,
+  symbolic links included), or the `resolver` given.
+- **`Compiled`** holds the compile result: **`compiled.image`** is
+  `ta_compile_image`'s bytes as `bytes`, copied at the first read and kept
+  (valid after `close` too; a first read after it raises
+  `TinyactorsError` with `TA_ERROR_STALE`; the maintainer, 2026-11-19,
+  replacing the buffer view, whose only gain was one copy of an image
+  read once), **`compiled.diagnostics`** the warnings and notes
   of a compilation that succeeded, converted once. It is a context
   manager, `with tinyactors.compile_charts(...) as compiled:`, whose exit
   and **`close()`** call `ta_compile_free`; the collector calls it as a
   fallback.
-- **`tinyactors.Host(config, io_processors={type: handler}, log=handler,
-  clock=None, telemetry=None, wake=None, migrated=None,
-  services=None, migration_done=None)`.**
-  Everything is per host: the config (a `dict`, written as CBOR into the
+- **`tinyactors.Host(charts, *, system, io_processors=None, config=None,
+  clock=None, store=None, resident=None, log=None, telemetry=None,
+  services=None, transport=None, on_done=None, on_error=None,
+  on_handler_error=None, migrated=None, migration_done=None)`** (the
+  maintainer, 2026-11-19, changed in place). `charts` is a `Compiled`,
+  an image's bytes (any buffer) or a list of them, each added with
+  `ta_host_add_image` in order at creation. `system` is the config's
+  `systemID` (passed to core as given: core checks it; `None` leaves it
+  out); `config` the rest of the config (a `dict`: `system`,
+  `migrateQuantum`, `telemetry`), refused with `TypeError` when it holds
+  `systemID` or `ioProcessors`; the config's `ioProcessors` are made from
+  `io_processors` in its order (support.py's `host_config`), a system id
+  of `"tinyactors-ask"` refused (reserved for `ask`'s replies).
+  Everything is per host: the config (written as CBOR into the
   call's arena for `ta_host_create`), the handlers and the clock. A host
   has no resolver ("The resolver"). No global configuration (no
   `logging.basicConfig`, no
   module-level handler, no default logger). The extension reads
-  `host.config` once at creation for `system.ticksPerSecond` (bindings.md
-  section 3).
+  `host.config` once at creation for `system.ticksPerSecond` and the
+  `systemID` (`host.system`; bindings.md section 3). **The binding picks the trace seed** (the maintainer,
+  2026-11-18): a config whose `"system"` has no `"traceSeed"` is copied
+  with a random 64-bit one from `os.urandom(8)`, as the nonce is drawn,
+  before `ta_host_create` (`ta_python_config_seeded`), so hosts start
+  different trace ids; a seed the caller sets is kept and reproduces;
+  `Host.restore` passes its config as given, its segments keeping the
+  snapshot's generators. Core stays free of I/O.
+- **Handlers take no host** (2026-11-19): `receive(send)`, `log(entry)`,
+  `telemetry(signal, data)`, a service handler `(invocation)` and its
+  service's `receive(send)` and `stop()`, `transport(send)`,
+  `migrated(migrated)`, `migration_done(result)`, a typed method's
+  `handler(result)` and `on_error(error)`. Every view and record (`Send`,
+  `LogEntry`, `Invocation`, `Migrated`) has `.host`.
 - **`with Host(...) as host`** (the synchronous driver) and **`async with
   Host(...) as host`** (asyncio) on the same class. Leaving either frees
   the host (`trace.end`, the last take of traces, `ta_host_free`); pending
@@ -114,16 +151,68 @@ Decided by the maintainer (2026-10-13); every item is in
 - **`host.chart(name) -> ChartRef`**: `ta_host_chart`, the current
   version of chart `name` (`host.h:121-126`); the reference holds the
   segment and the chart index.
-- **`host.spawn(ref, name=None, params=None, traceparent=None) -> int`**
-  (`ta_host_spawn`, `ta_spawn`), **`host.send(session, event, data=None,
-  *, traceparent=None)`** (`ta_host_send`), **`host.send_many(items) ->
+- **`tinyactors.Actor`** (support.py): what `spawn`, `actor()`,
+  `send.sender` and `on_done` give, a small immutable value of `(host,
+  id)`, compared and hashed by session, with `address`
+  (`Address.from_session`), `send`, `terminate`, the awaitable typed
+  methods `state()`, `context()`, `get()`, and `done`, a future the host
+  keeps in a dict by session only while someone awaits it, settled at the
+  actor's `TA_EFFECT_DONE` or `TA_EFFECT_ERROR` (`StaleError` for an
+  actor that ended already; never settled once the host closes). No
+  table of actors. Every call that takes a session takes an `Actor` too.
+  **`host.actor(which)`**: by session (`ta_host_locate`), by the name it
+  was spawned with (`ta_host_actor_by_name`), or by a local address
+  (`ta_host_resolve`); none: `StaleError`. **`await
+  host.actors(chart=None)`**: `actor.list` a page at a time, a chart's
+  name read for each with `ta_image_chart_name` (support.py's `actors`).
+- **`ask(event, data=None)`** (2026-11-19, step 8.6 item 6): request
+  and reply over existing calls. A row of the **asks** table (`ta_table`)
+  holds a future of the host's loop; the event goes with `origin`
+  `tinyactors://tinyactors-ask/@<the row's handle>` (a system id the
+  binding reserves: `Host` refuses it as its own); the chart answers
+  with `<send targetexpr="_event.origin">`, a send to another system, and
+  the drain takes it before the transport (`ta_python_ask_reply`): the
+  row found by the handle (a stale one: dropped) settles the future with
+  `(event, data)`. A cancelled future removes its row (a done callback);
+  rows left at close are dropped, never settled; no timeout of its own;
+  `TypeError` under the synchronous driver.
+- **`tinyactors.Spawner()`** (support.py; step 8.6 item 4): an I/O
+  processor whose `receive` spawns `send.data`'s `{chart, name, params}`
+  (`host.spawn`, the chart's current version under the name) and answers
+  `spawned` with `{name, address}` (`address` the new actor's session
+  address; the answer keeps the sendid), or fails the send (an unknown
+  chart, data of another shape, a spawn core refuses). It spawns; it
+  does not look names up (the maintainer, 2026-11-19, replacing a
+  get-or-spawn per version). A name has one owner: the collection actor
+  that decides which actors of a kind exist spawns those names, one
+  request at a time, and records its spawns in flight (the chat's
+  `creating`, keyed by sendid). Two actors spawning one name is the
+  application's design error; core then keeps the oldest holder within a
+  version and lets a newer version's win (`ta_host_actor_by_name`). A
+  spawn under an existing name after `add_image` of a new version is the
+  update: new spawns run the newest version, running actors finish on
+  theirs, `migrate` moves those that must not wait.
+- **`on_done(actor, donedata)`** and **`on_error(actor, error)`**: every
+  top-level actor that ends (`TA_EFFECT_DONE` with its donedata payload,
+  `TA_EFFECT_ERROR` with the fault in `FLAGS`, a `TinyactorsError` of
+  status `TA_ERROR_FATAL`); core gives no chart on these effects, so
+  they are one handler each, not per chart. **`on_handler_error(error,
+  effect)`**: an `Exception` a handler raised, with the view or record it
+  handled (`None` for telemetry, the store, `migration_done`, a typed
+  method's handler); a send whose processor raised is failed as before;
+  without it, the driver raises the first after the turn.
+- **`host.spawn(chart, name=None, params=None, traceparent=None) ->
+  Actor`** (`ta_host_spawn`, `ta_spawn`; `chart` a name, `ta_host_chart`,
+  or a `ChartRef`), **`host.send(session, event, data=None,
+  *, sendid=None, traceparent=None, origin=None)`** (`ta_host_send`; or
+  `host.send(message)`, below, "Other systems"), **`host.fail(target,
+  sendid=None)`**, **`host.send_many(items) ->
   int`** (`ta_host_send_many`: each item carries the arguments of `send`,
   `traceparent` included; it returns the length of the accepted prefix,
   `host.h:192-195`), **`host.terminate(session)`**
-  (`ta_host_terminate`), **`host.boot(segment)`** (`ta_host_boot`, the
-  image's boot actors), **`host.actor_by_name(name) -> int | None`**
-  (`ta_host_actor_by_name`, 2026-10-15: the live actor spawned with
-  `name`, newest segment first; `None` for core's 0): applied at the call, read during it; a payload
+  (`ta_host_terminate`; a hibernated actor is woken to end it, its blob loaded from the store and deleted there),
+  **`host.boot(segment)`** (`ta_host_boot`, the
+  image's boot actors): applied at the call, read during it; a payload
   moves to core on success and is released on refusal. Under asyncio an
   input made outside a turn schedules one turn.
 - **`traceparent` in: W3C text, parsed by core.** `ta_spawn.traceparent`
@@ -175,8 +264,11 @@ Decided by the maintainer (2026-10-13); every item is in
   resolves it ("The "python" datamodel"), so a refused construct or an
   unknown name is a `CompileError` at its line in `reader.py`, at compile
   time.
-- **I/O processors: `handler(host, send)`**, called once per
-  `TA_EFFECT_SEND` whose `IO_PROCESSOR` is that type's index in the
+- **I/O processors are objects** (2026-11-19): `io_processors={type:
+  processor}`, each with `receive(send)` (an `async def` allowed) and an
+  optional `location` for its config entry; a plain function is refused
+  with `TypeError` naming the type. `receive` is called once per
+  `TA_EFFECT_SEND` whose `IO_PROCESSOR` is 1 + that type's index in the
   config's `ioProcessors`. Actor output to the application goes through
   them, and nothing else (ADR 0012, decision 6).
   - `send.traceparent`: the sending step's trace as W3C text, or `None`
@@ -192,17 +284,22 @@ Decided by the maintainer (2026-10-13); every item is in
     (decided 2026-10-13: an answer keeps the trace); passing
     `traceparent=None` starts a new trace. `origin` and `raw` are
     `ta_event_in`'s (2026-10-15, W3C's BasicHTTP: the location to reply
-    to and the message as read).
+    to and the message as read). It returns `True` when delivered and
+    `False` when the sender ended (`ta_host_locate` refuses its session,
+    or `ta_host_send` gives `TA_ERROR_STALE`): the answer is dropped, as
+    XState drops an event sent to a stopped actor, and nothing raises
+    (the maintainer, 2026-11-18, the same rule as Node's); any other
+    refusal raises.
   - `send.fail()`: `ta_host_send` with `TA_EVENT_IN_ERROR_COMMUNICATION`,
     the `sendid` and `send.traceparent`
     (`tinyactors-core/include/tinyactors/system.h:155-157`: core places
     `error.communication` in the sender's queue); the event name is not
-    repeated.
+    repeated. It returns `True` or `False` as `answer()` does.
   - An I/O processor that makes a request of its own carries the trace
     on:
 
     ```python
-    def http_processor(host, send):
+    def receive(self, send):
         headers = {"traceparent": send.traceparent} if send.traceparent else {}
         response = client.post(send.target, json=send.data, headers=headers)
         send.answer("http.response", response.json())   # keeps send.traceparent
@@ -213,10 +310,11 @@ Decided by the maintainer (2026-10-13); every item is in
     avoid the round trip; nothing needs it now.
   - A plain function gets a **thin view** (below, "Thin views"); an
     **`async def`** handler is scheduled as a task and gets a
-    **materialized record**, made before it is scheduled. A processor
-    configured `sync` stops the run until its send is answered: its
-    sender waits until then (`host.h:215-228`), so an `async def`
-    handler may answer it later.
+    **materialized record**, made before it is scheduled. A send's
+    sender waits until the batch is acknowledged (`host.h`,
+    `ta_host_run`), so a plain function's answer or `fail()` comes
+    before the sender goes on; an `async def` handler answers after
+    the ack, when the sender has gone on.
   - **An `async def` handler under the synchronous driver**, which runs
     no event loop: entering the `Host` with `with` raises `TypeError`
     naming the handler. The check is made at registration
@@ -227,7 +325,7 @@ Decided by the maintainer (2026-10-13); every item is in
     failed completion, so the sender gets `error.communication`
     (`system.h:155-157`); the exception is raised from the driver after
     the turn, as any handler's is ("The loop").
-- **`telemetry=handler(host, signal, data)`** is the application's
+- **`telemetry=handler(signal, data)`** is the application's
   exporter (bindings.md section 4, "What reaches the application"): at a
   `TA_HOST_EFFECT_TRACES` or `_LOGS` the extension takes the request
   (`ta_host_traces`, `ta_host_logs`), copies the view once into `bytes`
@@ -248,30 +346,43 @@ Decided by the maintainer (2026-10-13); every item is in
   awaits the tasks of an `async def` handler's last take. A take the
   allocator refuses is reported and retried at the next turn: core gives
   no second effect until a take.
-- **Hibernation with the application's store** (bindings.md section 4,
-  2026-10-14): **`host.sweep(max_scan, limit) -> list[int]`** is
-  `ta_host_sweep` (the CLOCK sweep: sessions that did not run since the
-  previous sweep and can be hibernated now); **`host.hibernate(session)
-  -> bytes`** is `ta_host_hibernate`, its blob copied once (outside a
-  drain the batch of that output is acknowledged at once, from a handler
-  it joins the open one, as `metrics()`), refused with `TA_ERROR_STATE`
-  when the actor is not at a stable point; **`wake=handler(host,
-  session, migration)`** gets each `TA_EFFECT_WAKE` (an event or a due
-  delayed send for a hibernated session, one effect per hibernation,
-  `migration` `None`; or a migration asking for it, `migration` its id),
-  and the handler
-  calls **`host.wake(session, blob)`** (`ta_host_wake`), now or later (an
-  `async def` handler runs as a task; refused under `with`). Without a
-  `wake` handler the effect is dropped: the session stays hibernated and
-  its events wait until the application calls `wake`. An output taken
-  with no batch open opens a batch of its own, which the binding
-  acknowledges at once; with one open (a handler's call) it joins it.
-  The binding tracks this with a flag set from a take to its ack, never
-  by guessing from the call depth; and a drain stops at its bound before
-  a take, so no batch stays open between turns. A blob the copy into
-  `bytes` fails on is woken back from the view before the ack. Where the
-  blobs live, when to sweep and how many stay resident are the
-  application's; `tools/stress.py` is the pattern, with SQLite.
+- **Hibernation with a store** (2026-11-19, replacing `wake=`):
+  **`store=`** is an object with `save(session, blob)`, `load(session) ->
+  bytes` and `delete(session)`; the module ships **`MemoryStore()`** and
+  **`SQLiteStore(path)`** (support.py, sqlite3, one table).
+  **`resident=`** (with a store) is the most actors kept in memory: after
+  a turn whose run went idle with more (`ta_system_stats_get` of each
+  segment), the binding sweeps (`ta_host_sweep`, at most three
+  revolutions and a slice of 1024 sessions in the arena at a time),
+  hibernates (`ta_host_hibernate`) and saves each; an actor not at rest
+  or holding a value outside the table stays; a `save` that raises wakes
+  the actor back from the view (still valid before the ack), the
+  exception fetched first since the wake runs the datamodel's Python
+  code. A `TA_EFFECT_WAKE` loads, wakes (`ta_host_wake`) and deletes the
+  blob; one a migration asks for (`TA_EFFECT_FIELD_MIGRATION`) while the
+  bound is reached is kept in a dict on the host and loaded after a turn
+  with room (room made by hibernating the actors at rest), so a migration
+  of a mostly hibernated population moves the bound at a time. A
+  terminated hibernated actor's blob is deleted. Without a store a WAKE
+  is dropped: the actor stays hibernated until the application calls
+  `host.wake`. **`host.sweep(max_scan, limit) -> list[int]`**
+  (`ta_host_sweep`), **`host.hibernate(session) -> bytes`**
+  (`ta_host_hibernate`, its blob copied once; outside a drain the batch
+  of that output is acknowledged at once, from a handler it joins the
+  open one, as `metrics()`; `TA_ERROR_STATE` when the actor is not at a
+  stable point) and **`host.wake(session, blob)`** (`ta_host_wake`) stay,
+  operator calls for an application with a policy of its own. A blob
+  wakes only in the host that made it: `Host(...)` fills
+  `ta_host_environment.nonce` with `os.urandom(8)`, so `wake` refuses
+  another host's blob with `TA_ERROR_INVALID`; `Host.restore` draws none,
+  keeping the snapshot's identity. An output taken with no batch open
+  opens a batch of its own, which the binding acknowledges at once; with
+  one open (a handler's call) it joins it. The binding tracks this with
+  a flag set from a take to its ack, never by guessing from the call
+  depth; and a drain stops at its bound before a take, so no batch stays
+  open between turns. A blob the copy into `bytes` fails on is woken
+  back from the view before the ack. `tools/stress.py` is the pattern at
+  scale, with SQLite.
 - **Migration** (bindings.md section 4, 2026-10-14; the handler made the
   host's, and "migration" renamed migration, 2026-10-15): **`host.migrate(*,
   chart=None, session=None, wake=False, timeout=0) -> migration`** is
@@ -279,29 +390,30 @@ Decided by the maintainer (2026-10-13); every item is in
   `TA_HOST_MIGRATE_WAKE`; a timeout in seconds, converted to host ticks
   rounded up and counted from the clock advanced at the call) and returns core's migration id; the migration
   moves actors in later runs, so the call schedules a turn. Its
-  `MIGRATION_DONE` goes to the host's **`migration_done=handler(host,
-  result)`** with `{"migration", "migrated", "failed", "pending"}`, the
+  `MIGRATION_DONE` goes to the host's **`migration_done=handler(result)`** with `{"migration", "migrated", "failed", "pending"}`, the
   pending sessions read with `ta_host_migration_pending` at the dispatch
   (valid until the next run) into a `bytes` the list is made from;
   without the handler nothing is read. A handler of the host, not of the
   call: nothing waits in a table of ours, and a restored host's
   migrations reach the handler `Host.restore` was given.
-  **`migrated=handler(host, migrated)`** gets each
+  **`migrated=handler(migrated)`** gets each
   `TA_HOST_EFFECT_MIGRATED` as a thin `Migrated` view (`session`,
   `segment`, `chart`, `migration`); without it nothing is read.
-  `SEGMENT_FREED` is dropped: the host keeps the images. How to migrate a
-  mostly hibernated population with a bound on what is resident is the
-  application's (README, "Migration"; `tools/migration.py`).
+  `SEGMENT_FREED` is dropped: the host keeps the images. With `store=` and
+  `resident=` a migration's WAKEs are loaded as room allows (above);
+  `tools/migration.py` is the pattern.
 - **Snapshots** (2026-10-14): **`host.snapshot() -> bytes`** is
   `ta_host_snapshot_pack` with one datamodel state, labelled
   `tinyactors-cpython`: a CBOR map of the `"python"` datamodel's state
   (below, "The "python" datamodel") and quickjs's
   (`ta_datamodel_ecmascript_snapshot`), copied once into `bytes` (no
   arena: a snapshot's size is no call's scratch). **`Host.restore(snapshot,
-  config, io_processors=None, **handlers)`** is a class method that runs
+  charts, **Host's keywords)`** is a class method that runs
   `Host(...)`'s creation with `ta_host_snapshot_unpack`,
   `ta_host_snapshot_image` and `ta_host_restore` in place of
-  `ta_host_create`, then restores both datamodels before anything runs;
+  `ta_host_create`, then restores both datamodels before anything runs,
+  then adds each image of `charts` the pack does not hold (bytes
+  compared with `ta_host_snapshot_image`'s: a new version);
   a pack another program labelled is refused, an unaligned buffer copied.
   The restored host's clock reads its ticks plus an offset (mod 2^64)
   that puts it at the snapshot's time when it is restored (bindings.md
@@ -315,7 +427,7 @@ Decided by the maintainer (2026-10-13); every item is in
   The ECMAScript state is written into room for the last one's length,
   so it is written once in the usual case.
 - **Invoked services** (bindings.md section 4, 2026-10-14):
-  **`services={type: handler(host, invocation)}`**. At a
+  **`services={type: handler(invocation)}`**. At a
   `TA_EFFECT_INVOKE` the handler of its type (`EVENT`) gets a record,
   `tinyactors.Invocation` (made before the ack: a service outlives it),
   of `session`, `invokeid` (`SENDID`), `type`, `src` (`TARGET`), `data`
@@ -327,12 +439,13 @@ Decided by the maintainer (2026-10-13); every item is in
   `TA_EVENT_IN_FROM_INVOKE` and the token, **`invocation.done(data=None)`**
   with `TA_EVENT_IN_INVOKE_DONE` (the service is dropped then); both
   refuse with `TA_ERROR_STALE` once it ended. A `TA_EFFECT_SEND` with
-  `IO_PROCESSOR` `TA_NIL` goes to the service's **`receive(host, send)`**
+  `IO_PROCESSOR` `TA_NIL` goes to the service's **`receive(send)`**
   (a thin `Send` view, `type` `None`), a `TA_EFFECT_UNINVOKE` to its
-  **`stop(host)`** (then it is dropped); both optional. No handler, or a
+  **`stop()`** (then it is dropped); both optional. No handler, or a
   handler that raises: `ta_host_send` with
-  `TA_EVENT_IN_ERROR_COMMUNICATION` to the invoker, and the exception is
-  raised after the turn; none when an UNINVOKE of the same token follows
+  `TA_EVENT_IN_ERROR_COMMUNICATION` to the invoker, and a handler's
+  exception is raised after the turn (no handler raises nothing: a chart
+  picks the type); none when an UNINVOKE of the same token follows
   in the open batch (cancelled in the run that started it). A failed
   start stays as an entry marked failed, so each send to it gets
   `ERROR_COMMUNICATION` with its sendid, until the UNINVOKE (no `stop`).
@@ -346,17 +459,30 @@ Decided by the maintainer (2026-10-13); every item is in
   a type with no handler gives `ERROR_COMMUNICATION` without raising.
   At the stop the services are dropped, not
   stopped, as pending handlers are. `tools/services.py` is the pattern.
-- **Other systems** (ADR 0014, 2026-10-15): the config's I/O processor
-  marked `"remote"` is an ordinary I/O processor handler that gets every
-  send to another system's address (core decides local or not); its
-  `send.origin` is `TA_EFFECT_FIELD_ORIGIN`, the sender's address. The
-  other side calls **`host.send(target, event, data, origin=...)`**, where
-  `target` may be a local address (`str`) that core resolves
+- **Other systems** (ADR 0014, 2026-10-15; ADR 0017, 2026-10-16): the
+  host's **`transport=handler(send)`** gets every send to another
+  system's address (core decides local or not), a `TA_EFFECT_SEND` with
+  `IO_PROCESSOR` 0 (the SCXML processor), as a `Send` view (`type` `None`;
+  an `async def` handler is refused under `with`); it needs no config,
+  and without a handler the binding fails each such send. Its
+  `send.origin` is `TA_EFFECT_FIELD_ORIGIN`, the sender's address. A send
+  between systems is one message in two halves (ADR 0017, decision 4,
+  2026-10-16): **`send.message`** is the outgoing half, a dict of the
+  fields of `ta_event_in` (`target`, `event`, `data`, `sendid`, `origin`,
+  `traceparent`), and the other side's **`host.send(message)`** the
+  incoming half, which ignores keys it does not know; `host.send(target,
+  event, data, *, sendid, traceparent, origin)` is the same call with the
+  fields spelled out, `target` a session or a local address core resolves
   (`ta_host_resolve`) before the payload is made in the target session's
-  datamodel. Success needs no answer; `send.fail()` gives the sender
-  `error.communication`. No peers, envelopes or routes: the transport and
-  the wire encoding are the application's.
-- **`log=handler(host, entry)`** gets this host's `<log>` lines
+  datamodel. A failure is never a key of a message: **`host.fail(target,
+  sendid)`** (`TA_EVENT_IN_ERROR_COMMUNICATION`) is the application's
+  explicit call, when it believes the other side; `send.fail()` does it
+  inside the handler. `send.origin`, and the transport's `send.target`,
+  are `Address` values, whose **`.system`, `.session`, `.name`** core's
+  parser reads (`ta_address_parse`; decision 5), so neither the binding
+  nor the application parses the grammar. No peers, envelopes or routes:
+  the transport, the wire encoding and trust are the application's.
+- **`log=handler(entry)`** gets this host's `<log>` lines
   (`TA_EFFECT_LOG`) as thin views of `(session, label, text)`, no chart
   (decided 2026-10-13). Without a handler, the lines are discarded.
 - **Typed methods over post**: `actor_state`, `actor_context`,
@@ -367,20 +493,25 @@ Decided by the maintainer (2026-10-13); every item is in
   `(handler, on_error=None, /, **params)`, returning `None`, with
   `on_error` also taken by keyword (never passed to core as a param): the
   method's other params are keywords, passed to core as given, so core checks them and
-  answers in the reply (8.4; ROADMAP.md, "Decided in 8.4"). The handler `(host, result)` runs when the method's
-  `REPLY` is dispatched, in a later drain; `on_error(host, error)` gets a
+  answers in the reply (8.4; ROADMAP.md, "Decided in 8.4"). The handler `(result)` runs when the method's
+  `REPLY` is dispatched, in a later drain; `on_error(error)` gets a
   `TinyactorsError(code, reason, path, message)`; an error with no
   `on_error` is raised by the driver after the turn. A refusal at the
   call (`ta_host_post`: `TA_ERROR_NO_MEMORY`, `TA_ERROR_STATE`) raises at
-  once. No synchronous request, no raw `post`, no reply object, no future.
+  once. **Given no handler** (the maintainer, 2026-11-19, Node's shape;
+  root ROADMAP.md, step 8.6, item 20), under asyncio a method returns a
+  future of the host's loop that its reply settles, the error raised as
+  its class; still pending at close it never completes; under the
+  synchronous driver it raises `TypeError`. No synchronous request, no
+  raw `post`, no reply object.
 - **The message id is the handle of a row in the pending table**
   (`ta_table`) holding `(handler, on_error)`: the drain reads the
   `REPLY`'s `id` in C, finds the row with `ta_table_get` (O(1); the
   generation refuses a stale id), removes it and calls the handler. At
   `ta_host_free` the remaining rows are dropped and their handlers never
   called.
-- **`DONE` and `ERROR` are internal** (the rows of the session are
-  released); no notification is
+- **`DONE` and `ERROR` go to `on_done` and `on_error`** (above; the
+  datamodel's rows of the session went with `destroy`); no notification is
   defined (`actor.subscribe` and `actor.changed` are removed, ADR 0012
   decision 4), and the extension drops a
   `TA_HOST_EFFECT_NOTIFICATION` whose method it does not know.
@@ -414,8 +545,8 @@ static ta_python_next ta_python_turn(ta_python_host *host) {
         ta_run run = ta_host_run(host->h, TA_PYTHON_BUDGET); /* bounded: fuel per call */
         ta_python_drain(host);
         switch (run.status) {
-        case TA_RUN_EFFECTS:                                /* a sync I/O processor's send: answered in
-                                                               the drain, or its sender waits */
+        case TA_RUN_EFFECTS:                                /* senders waited for the batch the drain
+                                                               acked: they go on now */
         case TA_RUN_EFFECTS_FULL: continue;                 /* run again now */
         case TA_RUN_YIELDED:      return TA_PYTHON_NEXT_YIELD; /* budget spent, actors still runnable */
         case TA_RUN_IDLE:         host->deadline = run.next_deadline; /* UINT64_MAX: none */
@@ -437,10 +568,10 @@ is open (`TA_RUN_FAULT`, detail `TA_ERROR_STATE`), which the drain before each r
 drain: Python code a handler runs may call the `Host` to add inputs, post
 or read views; it never takes or acks.
 
-| `ta_python_turn` returns | Synchronous driver (`run_until_idle()`, `run()`, `SimulatedClock.increment(seconds)`) | asyncio (`await host.idle()`) |
+| `ta_python_turn` returns | Synchronous driver (`run_until_idle()`, `SimulatedClock.increment(seconds)`) | asyncio (`await host.idle()`) |
 |---|---|---|
 | `TA_PYTHON_NEXT_YIELD` | check signals (`PyErr_CheckSignals`; a `KeyboardInterrupt` is raised between turns), then turn again | yield to the loop: `loop.call_soon(turn)` |
-| `TA_PYTHON_NEXT_IDLE` | `run_until_idle()` returns; `run()` sleeps to `deadline` (converted with `system.ticksPerSecond`) and turns again; `increment(seconds)` advances the simulated clock (`ta_host_advance_time`, the simulated time as the wall clock) and turns until idle, arming nothing | one `loop.call_at` timer at `deadline` (none at `UINT64_MAX`), replacing the last; `idle()` completes; an input from outside a turn schedules one turn with `loop.call_soon` |
+| `TA_PYTHON_NEXT_IDLE` | `run_until_idle()` returns; `increment(seconds)` advances the simulated clock (`ta_host_advance_time`, the simulated time as the wall clock) and turns until idle, arming nothing | one `loop.call_at` timer at `deadline` (none at `UINT64_MAX`), replacing the last; `idle()` completes; an input from outside a turn schedules one turn with `loop.call_soon` |
 | `TA_PYTHON_NEXT_EXHAUSTED` | raise `MemoryError` naming the pool; the host stays usable and the next turn goes on where the run stopped | the same, from the turn |
 | `TA_PYTHON_NEXT_FAULT` | raise `TinyactorsError` with `ta_status_name(fault)` (the detail); not retried | the same |
 | a handler raised, or a reply's error had no `on_error` | finish the turn (the ack comes anyway), then raise the first | the same |
@@ -454,8 +585,10 @@ or read views; it never takes or acks.
   `trace.watch` ends at a time of the host's clock), and with an encoder
   after every run too (the run's span records are stamped between the
   clocks around it; else they stretch over the handlers of the drain
-  after it, to the next advance), one timer (the sync driver's sleep or
-  one asyncio `TimerHandle`) at `next_deadline`. A host created with a
+  after it, to the next advance), one timer (an asyncio `TimerHandle`) at
+  `next_deadline`; the synchronous driver arms none (`host.run()`, which
+  slept to it, was removed on 2026-11-19: asyncio serves a program that
+  waits for timers). A host created with a
   `SimulatedClock` arms no timer.
 
 ## Lifetimes and thin views
@@ -516,11 +649,11 @@ pays nothing for a field it does not read.
 | send record | the task | dispatch, before scheduling an `async def` processor | every field, at once | the collector | the host's |
 | log `entry` (thin view) | the handler, borrowed | dispatch of a `TA_EFFECT_LOG` | `session`, `label` (`AUXILIARY`), `text` (`EVENT`) on first read | the ack; then stale | the host's |
 | `Compiled` | the application | `compile_charts` | — | `with` exit, `close()` (`ta_compile_free`), or the collector (a fallback) | the creating one |
-| `compiled.image` (thin view) | the `Compiled` | first read | none: a read-only buffer over `ta_compile_image`'s bytes | `close()`; then stale | the creating one |
+| `compiled.image` | the `Compiled`, then the application | first read | `ta_compile_image`'s bytes, copied once | the collector | the creating one |
 | `compiled.diagnostics`, a `CompileError`'s diagnostics | the application | `compile_charts` | every diagnostic, once (their strings live in the result's arena until `ta_compile_free`) | the collector | — |
 | a reply's `result` | the handler | dispatch of a `TA_HOST_EFFECT_REPLY` | the whole result, once | the collector | the host's |
 | `TinyactorsError` from a reply | `on_error`, or the driver | the same dispatch | `code`, `reason`, `path`, `message` | the collector | the host's |
-| a session id | the application | `spawn` | — (`int`, 64 bits) | — | — |
+| `Actor` | the application | `spawn`, `actor()`, `send.sender`, `on_done` | — (`host` and `id`, an `int` of 64 bits) | — (an ended actor's calls raise `StaleError`) | the host's |
 | `_event` (in a chart) | the session's instance | `bind_event` | the strings during the call (`datamodel.h:35-37`); `data` is the row's value, the Event holds a reference on the row | the next `bind_event`, `detach_event` or `destroy` | the host's |
 | system variables (in a chart) | the session's instance | `create` | once, during the call (`datamodel.h:62-63`); immutable, shared by reference | the session's end | the host's |
 
@@ -588,6 +721,7 @@ APIs:
   | sessions | `{instance, chart, extra}`: the instance, its chart's row, the params until the first event or the old bindings after a `deserialize` | `create`, `deserialize` | `destroy` (after `serialize` too: a hibernated session is its blob) |
   | payloads | `{value, refcount}` | `capture`, `from_wire`, an input (`send`, `spawn`'s params, `answer`'s data), `migrate`'s bindings | refcount 0: the last reference is dropped after the outer call into core returns (deferred: dropping it can run Python code) |
   | pending | `{handler, on_error}` of a typed method | the method's call | its `REPLY`'s dispatch; `ta_host_free` (dropped, not called) |
+  | asks | `{future}` of an `ask` | `ask` | its reply's dispatch; its future's cancel; `ta_host_free` (dropped, never settled) |
 
 - **The datamodel's last output.** `to_wire`, `serialize` and
   `payload_serialize` write with a writer the datamodel keeps, overwritten
@@ -612,15 +746,8 @@ APIs:
   (`request->scratch`, from the start of `ta_compile_charts` to its
   return), so the extension keeps nothing per `src` past the call.
 - **A `Compiled` holds a compile result** until its `close()`;
-  `compiled.image` is a buffer over it. **`close()` while a buffer
-  exported from `image` is held raises `BufferError`** (decided
-  2026-10-13), as CPython's `bytearray` does when resized with exports:
-  `mv = memoryview(compiled.image); compiled.close()` raises, and the
-  result stays alive until `mv.release()`; without it `bytes(mv)` would
-  read freed memory. The `Compiled` counts its exports in the buffer
-  slots (CPython's `Py_bf_getbuffer` and `Py_bf_releasebuffer`, filled
-  with our functions; in the limited API from 3.11 by CPython's
-  documentation, not yet in the abi3 spike below: unverified).
+  `compiled.image` is a copy of the image as `bytes`, made at its first
+  read, so no buffer refers to the result once it is freed.
 
 ## The "python" datamodel
 
@@ -885,9 +1012,8 @@ Registered beside quickjs, first; matched by the chart's
   the turn, for a plain function and an `async def` task alike.
 - **`compile_charts` raises `CompileError` with every diagnostic**, a
   `.py` file's refused construct at its own line, a `ResolveError` at
-  the line and column it names; `compiled.image` read after `close()`
-  raises `TA_ERROR_STALE`, and `close()` while a `memoryview` of it is
-  held raises `BufferError`.
+  the line and column it names; `compiled.image` is `bytes` copied
+  once, and its first read after `close()` raises `TA_ERROR_STALE`.
 - **`TA_EFFECT_REQUEST` is answered in C with `TA_ERROR_INVALID`** (the
   parent's `error.execution`) until run-time fetching is built; no Python
   code runs.
@@ -902,7 +1028,8 @@ Registered beside quickjs, first; matched by the chart's
 ## What not to build
 
 - No synchronous request, no raw `post`, no request facade, no reply
-  object or future: typed methods take response handlers.
+  object: typed methods take response handlers, or under asyncio return a
+  future their reply settles.
 - No re-reading `ta_host_effects` until stable, no consumed marks, no
   nested drain, no ack inside a handler.
 - No eager conversion of an effect: a thin view, and a record only where
@@ -918,13 +1045,12 @@ Registered beside quickjs, first; matched by the chart's
   compile time, and a REQUEST is answered in C with `TA_ERROR_INVALID`
   until run-time fetching is built (root `ROADMAP.md`, "Decided
   later").
-- No `DirectoryResolver` in the extension: it is the convenience layer's,
-  in Python.
-- No application callback for `DONE` or `ERROR`; no subscription.
+- No subscription; no handler of `DONE` or `ERROR` per chart (core
+  gives no chart on them).
 - No defaults, limits, methods, events or messages of our own; nothing C
   does done again in Python (bindings.md section 2).
-- No convenience layer yet ("Layers"): no `add_image` from a mapping, no
-  spawn by chart name, no chart builder in 8.4.
+- No chart builder yet ("Layers"); no table of actors (an `Actor` is
+  made where the API returns one).
 - No serialization on the hot path, no struct layout read from Python.
 
 ## Tasks
@@ -947,7 +1073,8 @@ build for) and uv; the C toolchain is the root's.
   `python -m conform`, with `--kind binding`, on the native datamodel and
   on quickjs (both must pass); `-- --milestone <M>` runs one of the
   suite's sets (`tinyactors-test/suites/milestones.txt`).
-- `mise run test`: lint, build, both interpreters, and the suite's set
+- `mise run test`: lint, build, both interpreters (`tests/`, then each
+  example's `test_*.py` from its own directory), and the suite's set
   named by `MILESTONE` in `mise/cpython.rb` once the adapter exists. Its
   `#MISE sources` list this project's files, core's and the suite's. An
   exhaustive test goes behind `--full` (root `AGENTS.md`).
@@ -1008,6 +1135,7 @@ README.md, CHANGELOG.md, mise.toml, pyproject.toml, sgconfig.yml
 ROADMAP.md           the work in progress: plan, progress, how it runs, requests to core
 docs/api-map.md      each API item → ta_* function, method or effect (checked)
 docs/values.md       the Python side of the value table
+docs/guide/          guides the README links: missing-actors.md (a send to an actor that is not there)
 src/                 extension.h, docs.h (every public docstring: when and how to use an item,
                      where it fits; tests/test_docs.py checks each item has one),
                      module.c, host.c (Host, inputs, the arena's marks),
@@ -1015,9 +1143,13 @@ src/                 extension.h, docs.h (every public docstring: when and how t
                      records), methods.c (typed methods, the pending table), values.c,
                      compile.c (compile_charts, compile_system, Compiled, the resolver, ResolveError),
                      datamodel/{datamodel.h, datamodel.c, rows.c, expressions.c,
-                     support.py (the rewrite, the exceptions; embedded, not shipped)}
+                     support.py (the rewrite, the exceptions, Actor, the stores, Host's
+                     config; embedded, not shipped)}
 conform/             the suite's adapter, python -m conform; not in the wheel
 tests/               what the suite cannot see: threads, GC, asyncio, refusals, stale views
+examples/            applications over the package, each with a README and test_*.py (mise run test);
+                     chat/: workspaces, rooms and connections, a processor per external system,
+                     a store, and the three ways of a send to an actor that is not there
 tools/lint/          rules/, tests/, utils/ (ast-grep)
 mise/cpython.rb      what the tasks share
 mise/wheel.rb        the wheel: the release build per target, its checks, the zip, the smoke tests

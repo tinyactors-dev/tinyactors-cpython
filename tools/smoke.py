@@ -22,13 +22,14 @@ CHARTS = pathlib.Path(__file__).resolve().parent / "charts"
 
 def count(datamodel):
     logs = []
-    with tinyactors.Host({"systemID": "smoke"}, log=lambda host, entry: logs.append(entry.text)) as host:
-        chart = (CHARTS / ("counter.%s.scxml" % datamodel)).read_text()
-        with tinyactors.compile_charts([("counter.scxml", chart)]) as compiled:
-            host.add_image(compiled.image)
-        session = host.spawn(host.chart("counter"))
+    chart = (CHARTS / ("counter.%s.scxml" % datamodel)).read_text()
+    with tinyactors.compile_charts([("counter.scxml", chart)]) as compiled:
+        host = tinyactors.Host(compiled, system="smoke", log=lambda entry: logs.append(entry.text))
+    with host:
+        actor = host.spawn("counter")
         for value in (1, "two", {"three": [3]}):
-            host.send(session, "inc", value)
+            actor.send("inc", value)
+        session = actor.id
         host.send(session, "report")
         host.run_until_idle()
     return logs

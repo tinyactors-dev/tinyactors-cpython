@@ -5,17 +5,19 @@ import asyncio
 import unittest
 
 import tinyactors
-from support import fixture, load, text
+from support import APP, fixture, load, processors_of, text
 
 DOCUMENT = fixture("test_telemetry/log.python.scxml")
+# A chart that sends `out` to the application's processor at `go`.
+ECHO = fixture("test_telemetry/echo.python.scxml")
 
 
 def config(**telemetry):
-    return {"systemID": "t", "system": {"ticksPerSecond": 1000}, "telemetry": dict({"flushInterval": 100}, **telemetry)}
+    return {"system": {"ticksPerSecond": 1000}, "telemetry": dict({"flushInterval": 100}, **telemetry)}
 
 
 def host_with(handler, clock=None, **telemetry):
-    host = tinyactors.Host(config(**telemetry), telemetry=handler, clock=clock or tinyactors.SimulatedClock())
+    host = tinyactors.Host([], system="t", config=config(**telemetry), telemetry=handler, clock=clock or tinyactors.SimulatedClock())
     with tinyactors.compile_charts([("c.scxml", DOCUMENT)]) as compiled:
         host.add_image(compiled.image)
     return host
@@ -25,7 +27,7 @@ def span_names(host, requests):
     names = []
     for signal, data in requests:
         if signal == "traces":
-            host.trace_spans_decode(lambda host, result: names.extend(span["name"] for span in result["spans"]),
+            host.trace_spans_decode(lambda result: names.extend(span["name"] for span in result["spans"]),
                                     traces=data)
     host.run_until_idle()
     return names
@@ -35,7 +37,7 @@ class Telemetry(unittest.TestCase):
     def test_traces_and_logs_reach_the_handler_as_bytes(self):
         got = []
         clock = tinyactors.SimulatedClock()
-        host = host_with(lambda host, signal, data: got.append((signal, data)), clock)
+        host = host_with(lambda signal, data: got.append((signal, data)), clock)
         host.send(host.spawn(host.chart("c")), "go")
         host.run_until_idle()
         self.assertEqual(got, [])  # staged until flushInterval passed
@@ -45,15 +47,46 @@ class Telemetry(unittest.TestCase):
         self.assertIn("scxml.macrostep go", span_names(host, got))
         host.close()
 
+    def test_decode_traces_reads_spans_without_a_host(self):
+        """The same spans as the typed method, with flags, links, the resource and the scope."""
+        got = []
+        clock = tinyactors.SimulatedClock()
+        host = host_with(lambda signal, data: got.append((signal, data)), clock)
+        host.send(host.spawn(host.chart("c")), "go")
+        host.run_until_idle()
+        clock.increment(0.2)
+        traces = [data for signal, data in got if signal == "traces"]
+        self.assertTrue(traces)
+        typed = []
+        host.trace_spans_decode(lambda result: typed.extend(result["spans"]), traces=traces[0])
+        host.run_until_idle()
+        host.close()
+        spans = tinyactors.decode_traces(traces[0])
+        self.assertEqual(len(spans), len(typed))
+        for span, expected in zip(spans, typed):
+            for key, value in expected.items():
+                self.assertEqual(span[key], value, key)
+            self.assertEqual(span["links"], [])
+            self.assertIsInstance(span["flags"], int)
+            self.assertEqual(span["resource"], {})  # the config gives the resource no attributes
+            self.assertEqual(span["scope"]["name"], "tinyactors")
+            self.assertEqual(span["scope"]["attributes"]["tinyactors.chart.name"], "c")
+        self.assertEqual(tinyactors.decode_traces(memoryview(traces[0])), spans)
+        self.assertEqual(tinyactors.decode_traces(b""), [])
+        with self.assertRaises(tinyactors.InvalidError):
+            tinyactors.decode_traces(b"\xff\xff\xff")
+        with self.assertRaises(TypeError):
+            tinyactors.decode_traces("not bytes")
+
     def test_close_hands_over_the_last_take(self):
         got = []
-        host = host_with(lambda host, signal, data: got.append((signal, data)), flushInterval=0)
+        host = host_with(lambda signal, data: got.append((signal, data)), flushInterval=0)
         host.send(host.spawn(host.chart("c")), "go")
         host.run_until_idle()
         self.assertEqual(got, [])  # no flush interval: only a full staging or the stop
         host.close()
         self.assertIn("traces", [signal for signal, _ in got])
-        decoder = tinyactors.Host({"systemID": "d"})
+        decoder = tinyactors.Host([], system="d")
         self.assertIn("scxml.macrostep go", span_names(decoder, got))
         decoder.close()
 
@@ -64,7 +97,7 @@ class Telemetry(unittest.TestCase):
         host.send(host.spawn(host.chart("c")), "go")
         host.run_until_idle()  # and nothing was left open for the run
         host.close()
-        plain = tinyactors.Host({"systemID": "t"})
+        plain = tinyactors.Host([], system="t")
         with self.assertRaises(tinyactors.TinyactorsError) as raised:
             plain.metrics()
         self.assertEqual(raised.exception.status, "TA_ERROR_STATE")
@@ -73,7 +106,7 @@ class Telemetry(unittest.TestCase):
     def test_metrics_from_a_handler_join_the_batch(self):
         got = []
 
-        def handler(host, signal, data):
+        def handler(signal, data):
             got.append(len(host.metrics()))
 
         clock = tinyactors.SimulatedClock()
@@ -87,7 +120,7 @@ class Telemetry(unittest.TestCase):
         host.close()
 
     def test_a_handler_that_raises_is_raised_after_the_turn(self):
-        def handler(host, signal, data):
+        def handler(signal, data):
             raise ConnectionError("collector down")
 
         clock = tinyactors.SimulatedClock()
@@ -105,12 +138,12 @@ class Telemetry(unittest.TestCase):
     def test_an_async_handler_runs_as_a_task(self):
         got = []
 
-        async def handler(host, signal, data):
+        async def handler(signal, data):
             await asyncio.sleep(0)
             got.append(signal)
 
         async def main():
-            async with tinyactors.Host(config(flushInterval=0), telemetry=handler) as host:
+            async with tinyactors.Host([], system="t", config=config(flushInterval=0), telemetry=handler) as host:
                 with tinyactors.compile_charts([("c.scxml", DOCUMENT)]) as compiled:
                     host.add_image(compiled.image)
                 host.send(host.spawn(host.chart("c")), "go")
@@ -120,6 +153,43 @@ class Telemetry(unittest.TestCase):
 
         asyncio.run(main())
         self.assertIn("traces", got)  # the last take, at the exit of async with
+
+
+class TraceSeed(unittest.TestCase):
+    """The binding picks a random trace seed when the config gives none (the
+    maintainer, 2026-11-18); a seed the caller sets is kept and reproduces."""
+
+    def first_trace(self, system):
+        config = {}
+        if system is not None:
+            config["system"] = system
+        given = repr(config)
+        traces, seeds = [], []
+
+        def processor(send):
+            traces.append(send.traceparent.split("-")[1])
+
+        with tinyactors.Host([], system="t", config=config, io_processors=processors_of({APP: processor}),
+                             clock=tinyactors.SimulatedClock()) as host:
+            self.assertEqual(repr(config), given, "the caller's config is not changed")
+            with tinyactors.compile_charts([("echo.scxml", ECHO)]) as compiled:
+                host.add_image(compiled.image)
+            host.send(host.spawn(host.chart("echo")), "go")
+            host.host_config(lambda result: seeds.append(result["system"]["traceSeed"]))
+            host.run_until_idle()
+        return traces[0], seeds[0]
+
+    def test_hosts_without_a_seed_start_different_trace_ids(self):
+        a, b = self.first_trace(None), self.first_trace({"ticksPerSecond": 1000})
+        self.assertNotEqual(a[0], b[0])
+        self.assertNotEqual(a[1], b[1])
+
+    def test_a_given_seed_is_kept_and_reproduces(self):
+        a, b = self.first_trace({"traceSeed": 7}), self.first_trace({"traceSeed": 7})
+        self.assertEqual(a[0], b[0])
+        self.assertEqual(a[1], 7)
+        zero, again = self.first_trace({"traceSeed": 0}), self.first_trace({"traceSeed": 0})
+        self.assertEqual((zero[0], zero[1]), (again[0], 0), "a given 0 is a seed too")
 
 
 class ApplicationTraces(unittest.TestCase):
@@ -135,26 +205,26 @@ class ApplicationTraces(unittest.TestCase):
         stock = fixture("test_telemetry/stock.python.scxml")
         got, seen = [], []
 
-        def processor(host, send):
+        def processor(send):
             seen.append((send.traceparent, time.time_ns()))
-            time.sleep(0.02)  # a slow handler: the actor's spans must not be stretched over it
+            time.sleep(0.02)  # a slow handler: only its sender's spans wait for it
             send.answer("reserved")  # a later turn, whose clocks come after the handler
 
-        config = {"systemID": "t", "ioProcessors": [{"type": APP}], "telemetry": {}}
-        host = tinyactors.Host(config, {APP: processor}, telemetry=lambda host, signal, data: got.append((signal, data)))
+        host = tinyactors.Host([], system="t", config={"telemetry": {}}, io_processors=processors_of({APP: processor}),
+                               telemetry=lambda signal, data: got.append((signal, data)))
         with tinyactors.compile_charts([("front.scxml", front), ("stock.scxml", stock)]) as compiled:
             host.add_image(compiled.image)
         front_session, stock_session = host.spawn(host.chart("front")), host.spawn(host.chart("stock"))
         host.run_until_idle()
-        host.send(front_session, "order", {"to": "#_scxml_%d" % stock_session},
+        host.send(front_session, "order", {"to": "#_scxml_%d" % stock_session.id},
                   traceparent="00-%s-%s-01" % (self.APP_TRACE, self.APP_SPAN))
         host.run_until_idle()
         host.close()  # the last take
-        decoder = tinyactors.Host({"systemID": "d"})
+        decoder = tinyactors.Host([], system="d")
         spans = []
         for signal, data in got:
             if signal == "traces":
-                decoder.trace_spans_decode(lambda host, result: spans.extend(result["spans"]), traces=data)
+                decoder.trace_spans_decode(lambda result: spans.extend(result["spans"]), traces=data)
         decoder.run_until_idle()
         decoder.close()
         ours = {(span["name"], span["attributes"].get("tinyactors.chart.name")): span
@@ -169,8 +239,9 @@ class ApplicationTraces(unittest.TestCase):
         self.assertEqual(handling["parent"], reserve["span"])
         traceparent, handled_at = seen[0]
         self.assertEqual(traceparent, "00-%s-%s-01" % (self.APP_TRACE, handling["span"]))  # and out to the application
-        self.assertLessEqual(reserve["end"], handled_at)  # stamped within its run, before the handler ran
-        self.assertLessEqual(handling["end"], handled_at)
+        # the sender waits for its send to be handled: its macrostep ends after the handler
+        self.assertGreaterEqual(reserve["end"], handled_at)
+        self.assertGreaterEqual(handling["end"], handled_at)
         self.assertLess(order["end"] - order["start"], 10_000_000)  # microseconds, not the handler's 20 ms
 
 
@@ -186,7 +257,7 @@ class Stopping(unittest.TestCase):
     def test_close_from_the_handler_of_the_last_take(self):
         got = []
 
-        def handler(host, signal, data):
+        def handler(signal, data):
             got.append(signal)
             host.close()  # deferred: the close running now finishes
 
@@ -198,7 +269,7 @@ class Stopping(unittest.TestCase):
     def test_inputs_from_the_handler_of_the_last_take_end(self):
         calls = []
 
-        def handler(host, signal, data):
+        def handler(signal, data):
             calls.append(signal)
             host.send(host.spawn(host.chart("c")), "go")  # more records, at every take
 
@@ -209,22 +280,22 @@ class Stopping(unittest.TestCase):
 
     def test_metrics_from_the_handler_of_the_last_take(self):
         sizes = []
-        host = self.staged(lambda host, signal, data: sizes.append(len(host.metrics())))
+        host = self.staged(lambda signal, data: sizes.append(len(host.metrics())))
         host.close()
         self.assertTrue(sizes and all(sizes))
 
     def test_a_close_a_handler_asked_for_raises_from_the_driver(self):
         state = {"closing": False}
 
-        def handler(host, signal, data):
+        def handler(signal, data):
             if state["closing"]:
                 raise ConnectionError("down at close")
 
-        def log(host, entry):
+        def log(entry):
             state["closing"] = True
             host.close()
 
-        host = tinyactors.Host(config(flushInterval=0), telemetry=handler, log=log, clock=tinyactors.SimulatedClock())
+        host = tinyactors.Host([], system="t", config=config(flushInterval=0), telemetry=handler, log=log, clock=tinyactors.SimulatedClock())
         with tinyactors.compile_charts([("c.scxml", DOCUMENT)]) as compiled:
             host.add_image(compiled.image)
         host.send(host.spawn(host.chart("c")), "go")
@@ -235,7 +306,7 @@ class Stopping(unittest.TestCase):
     def test_async_with_awaits_the_async_last_take(self):
         got = []
 
-        async def handler(host, signal, data):
+        async def handler(signal, data):
             await asyncio.sleep(0.01)
             got.append(signal)
             if signal == "logs":
@@ -243,7 +314,7 @@ class Stopping(unittest.TestCase):
 
         async def main():
             with self.assertRaises(ConnectionError):
-                async with tinyactors.Host(config(flushInterval=0), telemetry=handler) as host:
+                async with tinyactors.Host([], system="t", config=config(flushInterval=0), telemetry=handler) as host:
                     with tinyactors.compile_charts([("c.scxml", DOCUMENT)]) as compiled:
                         host.add_image(compiled.image)
                     host.send(host.spawn(host.chart("c")), "go")
@@ -261,7 +332,7 @@ def charts_traced(host, requests):
     traced = []
     for signal, data in requests:
         if signal == "traces":
-            host.trace_spans_decode(lambda host, result: traced.extend(
+            host.trace_spans_decode(lambda result: traced.extend(
                 span["attributes"].get("tinyactors.chart.name") for span in result["spans"]
                 if span["name"] == "scxml.macrostep go"), traces=data)
     host.run_until_idle()
@@ -273,7 +344,7 @@ class Watches(unittest.TestCase):
     def test_a_watch_traces_what_it_matches_until_it_ends(self):
         got, replies = [], []
         clock = tinyactors.SimulatedClock()
-        host = tinyactors.Host(config(flushInterval=10), telemetry=lambda host, signal, data: got.append((signal, data)),
+        host = tinyactors.Host([], system="t", config=config(flushInterval=10), telemetry=lambda signal, data: got.append((signal, data)),
                                clock=clock)
         with tinyactors.compile_charts(TWO) as compiled:
             host.add_image(compiled.image)
@@ -286,23 +357,23 @@ class Watches(unittest.TestCase):
             clock.increment(0.02)  # past flushInterval: the requests come
             return charts_traced(host, got)
 
-        host.trace_configure(lambda host, result: replies.append(result), sample=0)  # nothing is sampled but what a watch keeps
-        host.trace_watch(lambda host, result: replies.append(result),
+        host.trace_configure(lambda result: replies.append(result), sample=0)  # nothing is sampled but what a watch keeps
+        host.trace_watch(lambda result: replies.append(result),
                          rules=[{"chart": "b", "sample": "sample", "detail": "full"}], seconds=1)
         host.run_until_idle()
         self.assertEqual(replies[-1], {"id": 1})
         self.assertEqual(step(), ["b"])
         clock.increment(1)  # the watch's end: a deadline of the host's clock
         self.assertEqual(step(), [])
-        host.trace_watch(lambda host, result: replies.append(result), rules=[{"chart": "a", "sample": "sample"}],
+        host.trace_watch(lambda result: replies.append(result), rules=[{"chart": "a", "sample": "sample"}],
                          seconds=None)
         host.run_until_idle()
         self.assertEqual(step(), ["a"])
-        host.trace_unwatch(lambda host, result: replies.append(result), id=replies[-1]["id"])
+        host.trace_unwatch(lambda result: replies.append(result), id=replies[-1]["id"])
         host.run_until_idle()
         self.assertEqual(step(), [])
         errors = []
-        host.trace_unwatch(print, lambda host, error: errors.append(error.reason), id=2)
+        host.trace_unwatch(print, lambda error: errors.append(error.reason), id=2)
         host.run_until_idle()
         self.assertEqual(errors, ["stale"])
         host.close()
@@ -311,8 +382,8 @@ class Watches(unittest.TestCase):
         got = []
 
         async def main():
-            config = {"systemID": "t", "telemetry": {"flushInterval": 1_000_000}}  # 1 ms: ticks are ns by default
-            async with tinyactors.Host(config, telemetry=lambda host, signal, data: got.append((signal, data))) as host:
+            config = {"telemetry": {"flushInterval": 1_000_000}}  # 1 ms: ticks are ns by default
+            async with tinyactors.Host([], system="t", config=config, telemetry=lambda signal, data: got.append((signal, data))) as host:
                 with tinyactors.compile_charts(TWO) as compiled:
                     host.add_image(compiled.image)
 
@@ -322,8 +393,8 @@ class Watches(unittest.TestCase):
                         await host.idle()
 
                 a = host.spawn(host.chart("a"))
-                host.trace_configure(lambda host, result: None, sample=0)
-                host.trace_watch(lambda host, result: None, rules=[{"chart": "a", "sample": "sample"}], seconds=0.1)
+                host.trace_configure(lambda result: None, sample=0)
+                host.trace_watch(lambda result: None, rules=[{"chart": "a", "sample": "sample"}], seconds=0.1)
                 await settle()
                 got.clear()
                 host.send(a, "go")

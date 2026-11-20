@@ -17,6 +17,13 @@ resolver's errors and scratch arena; and `detach_event` checked) and 8.3 (the fu
 C) done. The plan of both bindings is the root roadmap's step 8, which
 decides.
 
+## Step 8.6: the application API
+
+The API applications use, decided 2026-11-19: the root
+[ROADMAP.md](../ROADMAP.md), step 8, "8.6", holds the decisions and
+the items, with their status. Read it there; this binding's items
+are the ones marked "both" and its own.
+
 ## Step 8.4: a minimal Python binding
 
 From the root ROADMAP.md, step 8, "8.4"; read it there before changing
@@ -684,7 +691,15 @@ Gaps in core or in the suite this session finds. Each says what is
 missing, why, and which suite case or test shows it; the coordinator moves
 it into the root ROADMAP.md's "Requests to core" and answers there.
 
-- **Open: one exhausted pool doubles every pool.** What: when any pool of a
+- **Answered (2026-10-17, core `7adbb343`, `5f2afad1`): one exhausted
+  pool doubles every pool.** A segment now grows only the pool that ran
+  out (the actors double, their instances and strings by what the added
+  actors need; another pool doubles or more, by at least a quarter of the
+  region), an explicit `instanceBytes` keeps its own part, and
+  `host.stats` reports each pool's `capacity`, `used` and `highWater`
+  under `pools` (`tinyactors-core/docs/requests.md`). 40,000 actors grown
+  from the default size: 48,967,040 B before, 12,634,136 B after (sized up
+  front: 10,415,192 B). The request as it was: when any pool of a
   segment runs out, `segment_grow` doubles all of them, derives
   `instanceBytes` again from the doubled `maxActors`, and holds the old and
   the new region at once (`src/host/host.c`, `segment_grow`). Why: a
@@ -697,7 +712,13 @@ it into the root ROADMAP.md's "Requests to core" and answers there.
   only the pool that ran out, keep an explicit `instanceBytes`, and report
   each pool's capacity and high-water mark in `host.stats`. Which test:
   the memory investigation's `grow_cliff.py` (2026-10-15).
-- **Open: the trace journal is sized from `maxEvents`.** What: with
+- **Answered (2026-10-17, core): the trace journal is sized from
+  `maxEvents`.** `traceBytes` now defaults to 131072
+  (`TA_TRACE_BYTES_DEFAULT`) whatever `maxEvents`, and a segment's growth
+  never grows it; `traceContexts` stays one per event slot (48 B: a queued
+  event holds one). 40,000 quickjs actors grown from the default and sent
+  one event each: 53,130,169 B before, 26,653,625 B after. The request
+  as it was: with
   tracing on (the default), `traceBytes` is 512 × `maxEvents` and
   `traceContexts` is `maxEvents` (`src/system/system.c`), 618 B per event
   slot. Why: sizing `maxEvents` for quickjs's actors (above) adds 618 B per

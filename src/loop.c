@@ -169,10 +169,11 @@ static ta_python_next ta_python_turn(ta_python_host *host) {
         if (bounded && run.status != TA_RUN_EXHAUSTED && run.status != TA_RUN_FAULT)
             return TA_PYTHON_NEXT_YIELD; /* the turn's bound: let the program run, then turn again */
         switch (run.status) {
-        case TA_RUN_EFFECTS:      /* a sync I/O processor's send: answered in the drain, or its sender waits */
+        case TA_RUN_EFFECTS:      /* senders waited for the batch the drain acked: they go on now */
         case TA_RUN_EFFECTS_FULL: continue; /* run again now */
         case TA_RUN_YIELDED:      return TA_PYTHON_NEXT_YIELD; /* budget spent, actors still runnable */
-        case TA_RUN_IDLE:         if (host->inputs) return TA_PYTHON_NEXT_YIELD; /* handlers fed inputs in the
+        case TA_RUN_IDLE:         ta_python_host_evict(host); /* store=, resident=: the surplus hibernated */
+                                  if (host->inputs) return TA_PYTHON_NEXT_YIELD; /* handlers fed inputs in the
                                                                                     drain: turn again for them */
                                   host->deadline = run.next_deadline; /* UINT64_MAX: none */
                                   return TA_PYTHON_NEXT_IDLE;
@@ -222,7 +223,7 @@ static int ta_python_driver_enter(ta_python_host *host, ta_python_call *call) {
 
 /* Turns until idle at the current time: `forever` sleeps to each deadline
  * and goes on, while there is one (a simulated clock sleeps never). */
-static PyObject *ta_python_drive(ta_python_host *host, int forever) {
+static PyObject *ta_python_drive(ta_python_host *host) {
     ta_python_call call;
     if (ta_python_driver_enter(host, &call) < 0) return NULL;
     if (host->has_async && host->loop == Py_None) {
@@ -230,7 +231,6 @@ static PyObject *ta_python_drive(ta_python_host *host, int forever) {
         PyErr_SetString(PyExc_TypeError, "a handler is an async def (an I/O processor, wake or telemetry): drive the host with await host.idle()");
         return NULL;
     }
-    PyObject *sleep = NULL;
     int status = 0;
     for (;;) {
         host->turning = 1;
@@ -248,24 +248,8 @@ static PyObject *ta_python_drive(ta_python_host *host, int forever) {
             }
             continue;
         }
-        if (!forever || host->deadline == UINT64_MAX || host->clock != Py_None) break;
-        if (!sleep) {
-            PyObject *time = PyImport_ImportModule("time");
-            sleep = time ? PyObject_GetAttrString(time, "sleep") : NULL;
-            Py_XDECREF(time);
-            if (!sleep) {
-                status = -1;
-                break;
-            }
-        }
-        PyObject *slept = PyObject_CallFunction(sleep, "d", ta_python_delay(host));
-        if (!slept) {
-            status = -1;
-            break;
-        }
-        Py_DECREF(slept);
+        break;
     }
-    Py_XDECREF(sleep);
     ta_python_leave(&call);
     if (status < 0) return NULL;
     if (host->error && !host->host) { /* a close a handler asked for ran at the leave, and its last take raised */
@@ -278,12 +262,7 @@ static PyObject *ta_python_drive(ta_python_host *host, int forever) {
 
 PyObject *ta_python_host_run_until_idle(PyObject *self, PyObject *unused) {
     (void)unused;
-    return ta_python_drive((ta_python_host *)self, 0);
-}
-
-PyObject *ta_python_host_run_forever(PyObject *self, PyObject *unused) {
-    (void)unused;
-    return ta_python_drive((ta_python_host *)self, 1);
+    return ta_python_drive((ta_python_host *)self);
 }
 
 /* ---- asyncio ----------------------------------------------------------------------- */
@@ -481,7 +460,7 @@ static PyObject *ta_python_clock_increment(PyObject *self, PyObject *amount) {
             return NULL;
         }
         ta_python_host *host = (ta_python_host *)referent;
-        PyObject *done = host && host->host ? ta_python_drive(host, 0) : Py_NewRef(Py_None);
+        PyObject *done = host && host->host ? ta_python_drive(host) : Py_NewRef(Py_None);
         Py_XDECREF(referent);
         if (!done) {
             Py_DECREF(hosts);

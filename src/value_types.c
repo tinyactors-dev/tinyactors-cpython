@@ -77,6 +77,58 @@ static PyObject *ta_python_address_text(ta_python_address *self, void *closure) 
     return Py_NewRef(self->text);
 }
 
+/* The address's parts, read by core's parser (ta_address_parse): 1 parsed,
+ * 0 not a tinyactors address, -1 with an exception. */
+static int ta_python_address_parts(ta_python_address *self, ta_address *out) {
+    Py_ssize_t size = 0;
+    const char *text = PyUnicode_AsUTF8AndSize(self->text, &size);
+    if (text == NULL) return -1;
+    return ta_address_parse((ta_string_view){text, (uint32_t)size}, out) == TA_OK;
+}
+
+/* .system: the system id; None when the text is no address. */
+static PyObject *ta_python_address_system(ta_python_address *self, void *closure) {
+    (void)closure;
+    ta_address parts;
+    int parsed = ta_python_address_parts(self, &parts);
+    if (parsed < 0) return NULL;
+    return parsed ? PyUnicode_FromStringAndSize(parts.system.pointer, (Py_ssize_t)parts.system.length)
+                  : Py_NewRef(Py_None);
+}
+
+/* .session: the session id of a #_scxml_<id> address; None otherwise. */
+static PyObject *ta_python_address_session(ta_python_address *self, void *closure) {
+    (void)closure;
+    ta_address parts;
+    int parsed = ta_python_address_parts(self, &parts);
+    if (parsed < 0) return NULL;
+    return parsed && parts.kind == TA_ADDRESS_SESSION ? PyLong_FromUnsignedLongLong(parts.session)
+                                                      : Py_NewRef(Py_None);
+}
+
+/* .name: the decoded name of an @<name> address; None otherwise. The name
+ * decodes in place of a bytes object of its encoded length (a decoded
+ * name is never longer), then as UTF-8. */
+static PyObject *ta_python_address_name(ta_python_address *self, void *closure) {
+    (void)closure;
+    ta_address parts;
+    int parsed = ta_python_address_parts(self, &parts);
+    if (parsed < 0) return NULL;
+    if (!parsed || parts.kind != TA_ADDRESS_NAME) return Py_NewRef(Py_None);
+    PyObject *bytes = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)parts.name.length);
+    char *room = bytes ? PyBytes_AsString(bytes) : NULL;
+    PyObject *name = NULL;
+    if (room) {
+        ta_buffer out = {room, parts.name.length, 0};
+        if (ta_address_name_decode(parts.name, &out) == TA_OK)
+            name = PyUnicode_DecodeUTF8(room, (Py_ssize_t)out.length, "strict");
+        else
+            PyErr_SetString(PyExc_ValueError, "the address's name does not decode");
+    }
+    Py_XDECREF(bytes);
+    return name;
+}
+
 /* str(Address) is for displaying or explicitly extracting its address.
  * It does not change the value's tagged encoding. */
 static PyObject *ta_python_address_str(ta_python_address *self) {
@@ -104,8 +156,91 @@ static PyObject *ta_python_address_compare(PyObject *left, PyObject *right, int 
                                ((ta_python_address *)right)->text, op);
 }
 
+/* The address core's formatter writes for `system` and `local` (a session
+ * when `session` is not 0, else the name): written into a bytes object of
+ * the longest it can be, then made a str and an Address. */
+typedef struct ta_python_address_parts_in {
+    ta_string_view system;
+    ta_string_view name;
+    uint64_t session;
+} ta_python_address_parts_in;
+
+static PyObject *ta_python_address_formatted(PyTypeObject *type, const ta_python_address_parts_in *in) {
+    size_t room = in->session ? TA_ADDRESS_SESSION_MAX : 13u + TA_ADDRESS_SYSTEM_MAX + 2u + 3u * (size_t)in->name.length;
+    PyObject *bytes = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)room);
+    if (!bytes) return NULL;
+    ta_buffer out = {PyBytes_AsString(bytes), room, 0};
+    ta_status status = in->session ? ta_address_format(in->system, in->session, &out)
+                                   : ta_address_format_name(in->system, in->name, &out);
+    PyObject *address = NULL;
+    if (status != TA_OK) {
+        PyErr_Format(PyExc_ValueError, "%s: %s", in->session ? "Address.from_session(system, session)"
+                                                             : "Address.from_name(system, name)",
+                     ta_address_system_valid(in->system) ? "an empty name" : "an invalid system id");
+    } else {
+        PyObject *text = PyUnicode_DecodeUTF8(out.pointer, (Py_ssize_t)out.length, "strict");
+        ta_python_module_state *state = text ? ta_python_codec_state(PyType_GetModule(type)) : NULL;
+        address = state ? ta_python_address_from_text(state, text) : NULL;
+        Py_XDECREF(text);
+    }
+    Py_DECREF(bytes);
+    return address;
+}
+
+/* A str's UTF-8, for the call. */
+static int ta_python_address_view(PyObject *text, ta_string_view *out) {
+    Py_ssize_t size = 0;
+    const char *pointer = PyUnicode_AsUTF8AndSize(text, &size);
+    if (!pointer) return -1;
+    if ((size_t)size > UINT32_MAX) {
+        PyErr_SetString(PyExc_OverflowError, "the text exceeds the core string length limit");
+        return -1;
+    }
+    *out = (ta_string_view){pointer, (uint32_t)size};
+    return 0;
+}
+
+/* Address.from_name(system, name): "tinyactors://<system>/@<name>", the name
+ * percent-encoded by core (ta_address_format_name). */
+static PyObject *ta_python_address_from_name(PyObject *type, PyObject *args) {
+    PyObject *system, *name;
+    if (!PyArg_ParseTuple(args, "UU:Address.from_name", &system, &name)) return NULL;
+    ta_python_address_parts_in in = {0};
+    if (ta_python_address_view(system, &in.system) < 0 || ta_python_address_view(name, &in.name) < 0) return NULL;
+    return ta_python_address_formatted((PyTypeObject *)type, &in);
+}
+
+/* Address.from_session(system, session): "tinyactors://<system>/#_scxml_<session>"
+ * (ta_address_format), the session an int from 1 to 2**64-1. */
+static PyObject *ta_python_address_from_session(PyObject *type, PyObject *args) {
+    PyObject *system, *session;
+    if (!PyArg_ParseTuple(args, "UO:Address.from_session", &system, &session)) return NULL;
+    if (!PyLong_Check(session) || PyBool_Check(session)) {
+        PyErr_SetString(PyExc_TypeError, "Address.from_session(system, session): session is an int");
+        return NULL;
+    }
+    ta_python_address_parts_in in = {0};
+    in.session = PyLong_AsUnsignedLongLong(session);
+    if (in.session == (uint64_t)-1 && PyErr_Occurred()) return NULL;
+    if (in.session == 0) {
+        PyErr_SetString(PyExc_ValueError, "Address.from_session(system, session): session is from 1");
+        return NULL;
+    }
+    if (ta_python_address_view(system, &in.system) < 0) return NULL;
+    return ta_python_address_formatted((PyTypeObject *)type, &in);
+}
+
+static PyMethodDef ta_python_address_methods[] = {
+    {"from_name", ta_python_address_from_name, METH_VARARGS | METH_CLASS, ta_python_doc_address_from_name},
+    {"from_session", ta_python_address_from_session, METH_VARARGS | METH_CLASS, ta_python_doc_address_from_session},
+    {NULL, NULL, 0, NULL}
+};
+
 static PyGetSetDef ta_python_address_properties[] = {
     {"text", (getter)ta_python_address_text, NULL, ta_python_doc_address_text, NULL},
+    {"system", (getter)ta_python_address_system, NULL, ta_python_doc_address_system, NULL},
+    {"session", (getter)ta_python_address_session, NULL, ta_python_doc_address_session, NULL},
+    {"name", (getter)ta_python_address_name, NULL, ta_python_doc_address_name, NULL},
     {NULL, NULL, NULL, NULL, NULL}
 };
 
@@ -116,6 +251,7 @@ static PyType_Slot ta_python_address_slots[] = {
     {Py_tp_traverse, ta_python_address_traverse},
     {Py_tp_clear, ta_python_address_clear},
     {Py_tp_getset, ta_python_address_properties},
+    {Py_tp_methods, ta_python_address_methods},
     {Py_tp_str, ta_python_address_str},
     {Py_tp_repr, ta_python_address_repr},
     {Py_tp_hash, ta_python_address_hash},
